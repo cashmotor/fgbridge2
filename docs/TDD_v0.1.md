@@ -29,8 +29,7 @@ graph TD
 
     subgraph 代理执行层
         H[常驻助理 Process]
-        I[开发专家 Process]
-        J[其他专家 Process]
+        I[专家进程池 Process]
     end
 
     A <== "WebSocket (TLS)" ==> B
@@ -41,7 +40,6 @@ graph TD
     D -- "唤醒/分发" --> G
     G <--> H
     G <--> I
-    G <--> J
     G -- "发送消息/卡片 (HTTP API)" --> E
     E -- "回复结果/卡片更新" --> A
 ```
@@ -55,64 +53,61 @@ FGBridge2/
 ├── docs/                     # 文档目录
 ├── src/                      # 核心源码
 │   ├── listener/             # 接入层
-│   │   └── websocket.py      # [新建] 飞书 WebSocket 长连接监听器
+│   │   └── websocket.py      # 飞书 WebSocket 长连接监听器
 │   ├── engine/               # 核心业务引擎
-│   │   ├── router.py         # IM 消息路由与分发 (Scope-Topic 逻辑)
-│   │   └── dispatcher.py     # 异步任务调度与进程池管理
+│   │   ├── router.py         # 消息智能路由分发 (1v1/群聊差异化)
+│   │   └── dispatcher.py     # ACP 进程调度与 TTL 生命周期管理
 │   ├── provider/             # 外部依赖交互
-│   │   ├── acp.py            # [复用] Gemini CLI ACP 协议通信
-│   │   └── feishu_im.py      # [改造] 飞书 API 封装 (消息发送、资源下载)
+│   │   ├── acp.py            # Gemini CLI ACP 协议通信 (Identifier 驱动)
+│   │   └── feishu_im.py      # 飞书 API 封装 (Say Hi, 消息收发)
 │   ├── storage/              # 数据持久化
-│   │   └── state_store.py    # [改造] SQLite 路由与状态存储
+│   │   └── state_store.py    # SQLite 路由与状态存储
 │   ├── utils/
-│   │   ├── card_builder.py   # [新建] 飞书互动卡片构造器
-│   │   └── docx_builder.py   # [新建] Markdown 转文档块逻辑
-│   ├── config.py             # 配置管理
-│   └── main.py               # 服务启动入口 (启动 WebSocket 线程)
+│   │   ├── card_builder.py   # 飞书互动卡片构造器
+│   │   └── docx_builder.py   # Markdown 转文档块逻辑
+│   ├── config.py             # 配置管理 (Pydantic)
+│   └── main.py               # 服务启动入口与全局生命周期管理
 ├── .env                      # 环境变量
-└── requirements.txt          # 依赖清单
+└── Makefile                  # 构建与运行脚本
 ```
 
 ---
 
 ## 4. 模块设计与代码复用策略
 
-### 4.1 接入层：WebSocket Listener (全新开发)
-**实现方案**：
-- 使用 `lark-oapi` 官方 SDK 的 `ws.Client` 实现。
-- **并发处理**：SDK 接收到消息后，业务逻辑必须在独立线程或协程中执行，确保主监听回路能立即返回（响应飞书服务器），避免 3 秒超时重推。
-
-### 4.2 核心协议层：ACPProvider (100% 复用)
-**来源**：`demo/provider/acp.py`
+### 4.1 核心协议层：ACPProvider (100% 改造复用)
 **设计说明**：
-- 保持不变。ACP 的 JSON-RPC 机制与 WebSocket 的异步推送天然契合。
+- **Identifier 驱动**：摒弃不稳定的 UUID 依赖，统一使用 `Topic_ID` 作为标识。
+- **绝对路径一致性**：强制使用绝对路径读写 `.session`，解决子进程 CWD 漂移导致的记忆丢失。
 
-### 4.3 状态持久化：StateStore (80% 复用)
-**调整设计**：
-- 确认使用 **SQLite**。
-- 路由表记录 `topic_id` (即消息 `root_id`) 与 `session_id` 的绑定。
-
----
-
-## 5. 关键交互流程设计 (WebSocket 专项)
-
-### 5.1 互动卡片拦截 (针对 WebSocket)
-**流程**：
-1. `ACPProvider` 触发权限请求。
-2. 后端构造卡片，通过 `feishu_im.py` (HTTP API) 发送。
-3. 用户点击卡片按钮。
-4. **飞书通过现有的 WebSocket 连接**将 `card.action.trigger` 事件推送到 `listener/websocket.py`。
-5. 监听器识别事件类型，提取 `value` (包含 `confirm_id`)，通过队列交给 `router.py`。
-6. `router.py` 调用 `acp.confirm` 解锁 ACP 进程。
-
-### 5.2 资源下载
-**流程**：
-- 收到包含资源的文件消息后，立即 ACK。
-- 异步 Worker 调用 `feishu_im.py`，使用 `message-resource` 接口下载资源。
+### 4.2 状态持久化：StateStore
+- 存储 `Topic -> Session` 的持久化绑定，支持服务重启后的秒级恢复。
 
 ---
 
-## 6. 设计可行性确认
-- **事件全覆盖**：WebSocket 模式支持 `im.message.receive_v1` 和 `card.action.trigger`，满足所有交互需求。
-- **免公网配置**：完全符合内网安全部署要求。
-- **3秒响应**：通过 `asyncio.Queue` 完美规避处理耗时限制。
+## 5. 关键业务流程设计
+
+### 5.1 消息智能路由 (engine/router.py)
+系统通过识别 `chat_type` 实施差异化的记忆隔离与角色委派策略。
+
+**路由分发矩阵**：
+
+| 对话场景 | 触发特征 | 寻回标识 (Topic_ID) | 响应角色 | 说明 |
+| :--- | :--- | :--- | :--- | :--- |
+| **1v1 主时间轴** | `thread_id` 为空 | `chat_id` | 常驻助理 | 共享全局上下文记忆。 |
+| **1v1 子任务** | `thread_id` 不为空 | `thread_id` | 特定专家 | 只要有话题标识，即视为独立任务。 |
+| **群聊 初始/主轴** | `root_id` & `thread_id` 均空 | `chat_id` | 常驻助理 | 群内首发或主时间轴沟通。 |
+| **群聊 回复串** | 仅 `root_id` 有值 | `root_id` | 常驻助理 | 针对主轴消息的追加讨论，保持记忆。 |
+| **群聊 话题** | `thread_id` 有值 | `thread_id` | 特定专家 | 飞书原生话题模式，完全隔离。 |
+
+---
+
+## 6. 非功能设计
+
+### 6.1 优雅停机与通知
+- **Say Hi 机制**：启动发送 `🚀 已就绪`，停止发送 `🛑 已停止`。
+- **保护性退出**：使用 `asyncio.shield` 确保停机通知发出的概率，随后显式回收所有 ACP 进程。
+
+### 6.2 日志持久化
+- **全量追踪**：`fgb.log` (Rotation 50MB)。
+- **错误分流**：`error.log` 专用于监控严重异常。

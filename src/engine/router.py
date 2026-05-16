@@ -30,7 +30,10 @@ class Router:
     async def _handle_message(self, event_data: dict):
         message = event_data.get("message", {})
         chat_id = message.get("chat_id")
+        chat_type = message.get("chat_type") # "p2p" or "group"
         message_id = message.get("message_id")
+        
+        thread_id = message.get("thread_id") or ""
         root_id = message.get("root_id") or ""
         
         # 处理多模态附件
@@ -42,23 +45,57 @@ class Router:
         if not text and not attachments:
             return
 
-        # 1. 路由识别
-        if not root_id:
-            await self._route_to_role(config.assistant_role, chat_id, message_id, text, attachments)
-        else:
-            topic = await self.store.get_topic(root_id)
-            if not topic:
-                await self._bind_topic_and_route(chat_id, root_id, message_id, text, attachments)
+        # --- 精准差异化路由逻辑 ---
+        topic_id = ""
+        target_role = ""
+        is_subtask = False
+
+        if chat_type == "p2p":
+            # 1v1 模式：仅通过 thread_id 区分主轴和子任务
+            if thread_id:
+                topic_id = thread_id
+                is_subtask = True
             else:
-                await self._route_to_role(topic["role"], chat_id, message_id, text, attachments, topic)
+                topic_id = chat_id
+                target_role = config.assistant_role
+        else:
+            # 群聊模式：
+            if thread_id:
+                # 用户创建了话题 -> 专家子任务
+                topic_id = thread_id
+                is_subtask = True
+            elif root_id:
+                # 针对某条消息的回复串 -> 寻回助理会话
+                topic_id = root_id
+                target_role = config.assistant_role
+            else:
+                # 纯主轴第一次发言
+                topic_id = chat_id
+                target_role = config.assistant_role
+
+        # --- 核心修复：统一执行数据库寻回 ---
+        topic = await self.store.get_topic(topic_id)
+        
+        if is_subtask:
+            # 处理专家子任务
+            if not topic:
+                await self._bind_topic_and_route(chat_id, topic_id, message_id, text, attachments)
+            else:
+                await self._route_to_role(topic["role"], chat_id, message_id, text, attachments, topic, topic_id)
+        else:
+            # 处理助理主轴
+            await self._route_to_role(target_role, chat_id, message_id, text, attachments, topic, topic_id)
 
     async def _process_attachments(self, message: dict) -> list:
         """识别并下载消息中的图片/文件"""
         attachments = []
         message_id = message.get("message_id")
         
-        # 1. 处理图片
+        # 飞书推送的资源 Key 在 message 结构中
+        # 兼容处理：SDK 转换后可能是 image_keys 或 file_keys
         image_keys = message.get("image_keys", [])
+        file_keys = message.get("file_keys", [])
+        
         for key in image_keys:
             save_path = f"{config.attachment_dir}/{message_id}_{key[:8]}.png"
             if await self.feishu.download_resource(message_id, key, save_path):
@@ -69,57 +106,52 @@ class Router:
                     "data": data_base64,
                     "mimeType": "image/png"
                 })
-                logger.info(f"成功载入图片附件: {key}")
 
-        # 2. 处理文件
-        file_keys = message.get("file_keys", [])
         for key in file_keys:
-            # 飞书 SDK 返回的文件名逻辑
             save_path = f"{config.attachment_dir}/{message_id}_{key[:8]}"
             if await self.feishu.download_resource(message_id, key, save_path):
                 attachments.append({
                     "type": "resource_link",
                     "uri": f"file://{os.path.abspath(save_path)}"
                 })
-                logger.info(f"成功载入文件附件: {key}")
 
         return attachments
 
     async def _bind_topic_and_route(self, chat_id: str, root_id: str, message_id: str, text: str, attachments: list):
-        # 1. 调用助理识别意图 (简化版：目前先硬编码 Developer，但通过助理 ACP 逻辑预留)
-        # acp_assistant = self.dispatcher.get_acp(config.assistant_role)
+        # 1. 初始绑定：目前先硬编码 Developer
         role = "Developer" 
-        acp_expert = self.dispatcher.get_acp(role)
-        session_id = acp_expert.session_new()
+        # 获取一个干净的会话 ID
+        acp = self.dispatcher.get_acp(role)
+        session_id = acp.session_new()
         
+        # 保存并立即寻回，确保 topic 字典结构完整
         await self.store.save_topic(root_id, chat_id, role=role, session_id=session_id)
         topic = await self.store.get_topic(root_id)
-        await self._route_to_role(role, chat_id, message_id, text, attachments, topic)
+        await self._route_to_role(role, chat_id, message_id, text, attachments, topic, root_id)
 
-    async def _route_to_role(self, role: str, chat_id: str, message_id: str, text: str, attachments: list, topic: dict = None):
+    async def _route_to_role(self, role: str, chat_id: str, message_id: str, text: str, attachments: list, topic: dict, topic_id: str):
         acp = self.dispatcher.get_acp(role)
-        
-        if topic:
+        session_id = None
+
+        if topic and topic.get("session_id"):
             session_id = topic["session_id"]
-            # 关键：如果 ACP 进程是新唤醒的（或不包含该会话），尝试从磁盘加载
-            # 这里简化逻辑：总是尝试 load，ACP 内部会处理是否存在
-            logger.info(f"正在尝试恢复话题记忆 (session_id: {session_id})")
+            logger.info(f"检测到历史会话，尝试寻回内存/磁盘记忆: {session_id} (Role: {role})")
             if not acp.session_load(session_id):
-                logger.warning(f"话题 {topic['topic_id']} 记忆恢复失败，将作为新会话处理")
+                logger.warning(f"记忆寻回失败 (可能已被 CLI 清理)，将作为新会话处理")
                 session_id = acp.session_new()
         else:
             session_id = acp.session_new()
         
-        # 更新活跃时间及最新的 session_id (防止新建)
-        await self.store.save_topic(topic["topic_id"] if topic else message_id, chat_id, role=role, session_id=session_id)
+        # 更新数据库 (记录最新的 session_id 和活跃时间)
+        await self.store.save_topic(topic_id, chat_id, role=role, session_id=session_id)
 
         # 发送请求
         resp = acp.send(session_id, text, attachments)
         
-        # 响应后立即保存记忆 (实现 FR-2.2 的及时性)
+        # 响应后主动触发一次 CLI 原生保存
         acp.session_save(session_id)
         
-        await self._handle_acp_response(resp, chat_id, message_id, session_id, topic["topic_id"] if topic else message_id)
+        await self._handle_acp_response(resp, chat_id, message_id, session_id, topic_id)
 
     async def _handle_acp_response(self, resp: dict, chat_id: str, message_id: str, session_id: str, topic_id: str):
         result = resp.get("result", {})
@@ -129,14 +161,10 @@ class Router:
             action = result.get("action")
             message = result.get("message")
             
-            # 记录挂起状态
-            await self.store.add_pending_confirm(confirm_id, topic_id or message_id, session_id, action, message)
-            
-            # 发送确认卡片
+            await self.store.add_pending_confirm(confirm_id, topic_id, session_id, action, message)
             card_content = CardBuilder.build_permission_card(confirm_id, action, message)
             await self.feishu.reply(message_id, card_content, msg_type="interactive")
         else:
-            # 发送最终回答
             content = result.get("content", str(result))
             await self.feishu.reply(message_id, content)
 
@@ -150,15 +178,19 @@ class Router:
         pending = await self.store.get_pending_confirm(confirm_id)
         if not pending: return
         
-        # 找到对应的 ACP 进程并确认
-        # 这里需要 Dispatcher 支持通过 session_id 找进程，或者通过 role
-        # 简化版：假设专家角色
-        acp = self.dispatcher.get_acp("Developer") # TODO: 动态找角色
+        # 从数据库中寻回 Topic 判定角色
+        topic = await self.store.get_topic(pending["topic_id"])
+        role = topic["role"] if topic else config.assistant_role
+        
+        acp = self.dispatcher.get_acp(role)
         resp = acp.confirm(pending["session_id"], confirm_id, decision)
+        
+        # 保存操作后的新记忆
+        acp.session_save(pending["session_id"])
         
         await self.store.remove_pending_confirm(confirm_id)
         
-        # 更新卡片状态
+        # 更新卡片 UI
         new_card = CardBuilder.build_result_card(pending["action_type"], decision)
         await self.feishu.client.im.v1.message.apatch(
             lark.im.v1.PatchMessageRequest.builder()
@@ -167,5 +199,4 @@ class Router:
             .build()
         )
         
-        # 处理确认后的结果
         await self._handle_acp_response(resp, "", "", pending["session_id"], pending["topic_id"])

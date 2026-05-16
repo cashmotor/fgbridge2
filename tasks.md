@@ -31,8 +31,10 @@
 - [x] 编写飞书互动卡片构造器 (src/utils/card_builder.py) @med (2026-05-16)
 - [x] 实现高危操作的 WebSocket 回调拦截与处理逻辑 @high (2026-05-16)
 - [ ] 多模态附件（图片/文件）的流水线处理逻辑 @med
+- [ ] Say Hi消息改为卡片模式 @med
 
 ## [优化与打磨]
 - [ ] 专家进程的惰性退出 TTL 机制实现 @med
 - [ ] Gemini Context Caching 性能优化支持 @low
 - [ ] 结构化日志记录与错误追溯系统 @med
+- [ ] acp回复给lark的消息会携带session历史，需要trim只回复最新添加的内容 @high

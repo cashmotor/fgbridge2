@@ -47,7 +47,6 @@ class ACPProvider:
             template_path = Path(config.gemini_md_template_path)
             if template_path.exists():
                 target_md = target_cwd / "gemini.md"
-                # 如果目标文件不存在，或者模板更新了，则复制
                 if not target_md.exists():
                     logger.info(f"正在部署引导文件: {template_path} -> {target_md}")
                     shutil.copy2(template_path, target_md)
@@ -156,7 +155,6 @@ class ACPProvider:
         """流式读取二进制输出直到获得目标 ID 的响应"""
         start_time = time.time()
         stdout_buffer = b""
-        max_buffer_size = 1024 * 1024
 
         for pipe in [self._process.stdout, self._process.stderr]:
             if pipe:
@@ -167,7 +165,6 @@ class ACPProvider:
 
             poll_code = self._process.poll()
             pipes = [p for p in [self._process.stdout, self._process.stderr] if p]
-            
             if not pipes: raise ACPError("ACP 进程管道不可用")
 
             readable, _, _ = select.select(pipes, [], [], 0.1)
@@ -285,6 +282,29 @@ class ACPProvider:
         resp = self._call("session/new", params)
         return resp.get("result", {}).get("sessionId", "")
 
+    def session_load(self, session_id: str) -> bool:
+        """利用 sessionId 加载 CLI 原生管理的记忆"""
+        try:
+            params = {
+                "sessionId": session_id,
+                "cwd": config.gemini_cwd, 
+                "mcpServers": []
+            }
+            resp = self._call("session/load", params)
+            return "error" not in resp
+        except Exception as e:
+            logger.error(f"加载会话异常: {e}")
+            return False
+
+    def session_save(self, session_id: str) -> bool:
+        """保存当前会话到 CLI 默认存储"""
+        try:
+            params = {"sessionId": session_id}
+            return "error" not in self._call("session/save", params)
+        except Exception as e:
+            logger.error(f"保存会话异常: {e}")
+            return False
+
     def send(self, session_id: str, text: str, attachments: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
         """发送提示词"""
         prompt_parts = [{"type": "text", "text": text}]
@@ -326,39 +346,6 @@ class ACPProvider:
             return self._wait_for_prompt_completion(sid)
         
         return self._call("confirm", {"sessionId": session_id, "confirmationId": confirmation_id, "decision": decision})
-
-    def session_load(self, session_id: str) -> bool:
-        """恢复会话"""
-        try:
-            # 这里的 session_id 实际上是保存在 data/sessions 下的文件名或标识
-            session_path = Path(config.session_dir) / f"{session_id}.session"
-            if not session_path.exists():
-                logger.warning(f"找不到会话文件: {session_path}")
-                return False
-                
-            params = {
-                "sessionId": session_id, 
-                "path": str(session_path),
-                "cwd": config.gemini_cwd, 
-                "mcpServers": []
-            }
-            return "error" not in self._call("session/load", params)
-        except Exception as e:
-            logger.error(f"加载会话异常: {e}")
-            return False
-
-    def session_save(self, session_id: str) -> bool:
-        """保存会话到磁盘"""
-        try:
-            session_path = Path(config.session_dir) / f"{session_id}.session"
-            params = {
-                "sessionId": session_id,
-                "path": str(session_path)
-            }
-            return "error" not in self._call("session/save", params)
-        except Exception as e:
-            logger.error(f"保存会话异常: {e}")
-            return False
 
     def stop(self) -> None:
         """停止 ACP"""
