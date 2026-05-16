@@ -154,22 +154,14 @@ cython_debug/
 .gemini/
 
 # Project specific
-database.db
-app.log
 logs/
 *.db
 credentials.json
-FGBridge_PRD*
-FGBridge_TDD*
-TEST_PLAN*
 gemini.md
-set_up_prompts.md
-close_up_prompts.md
 .DS_Store
 demo*
 templates/demo*
-tests/
 debug_context*
-docs/
 demo/
 bak/
+.tmp/
