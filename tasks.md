@@ -32,6 +32,7 @@
 - [x] 实现高危操作的 WebSocket 回调拦截与处理逻辑 @high (2026-05-16)
 - [ ] 多模态附件（图片/文件）的流水线处理逻辑 @med
 - [ ] Say Hi消息改为卡片模式 @med
+- [ ] 接收到用户消息后，在对应用户消息上添加‘get’气泡（方法参见https://open.feishu.cn/document/im-v1/message/push_follow_up） @med
 
 ## [优化与打磨]
 - [ ] 专家进程的惰性退出 TTL 机制实现 @med

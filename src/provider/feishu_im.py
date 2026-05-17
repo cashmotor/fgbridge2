@@ -20,15 +20,27 @@ class FeishuIMProvider:
         )
 
     async def send_text(self, receive_id: str, content: str, receive_id_type: str = "chat_id") -> Optional[str]:
-        """发送普通文本消息"""
+        """发送文本或互动卡片消息 (自动识别内容格式)"""
+        msg_type = "text"
+        processed_content = json.dumps({"text": content})
+        
+        # 如果 content 是合法的 JSON 且包含卡片特征，自动切换为 interactive
+        try:
+            card_data = json.loads(content)
+            if isinstance(card_data, dict) and ("elements" in card_data or "header" in card_data):
+                msg_type = "interactive"
+                processed_content = content
+        except:
+            pass
+
         request = (
             lark.im.v1.CreateMessageRequest.builder()
             .receive_id_type(receive_id_type)
             .request_body(
                 lark.im.v1.CreateMessageRequestBody.builder()
                 .receive_id(receive_id)
-                .msg_type("text")
-                .content(json.dumps({"text": content}))
+                .msg_type(msg_type)
+                .content(processed_content)
                 .build()
             )
             .build()
@@ -75,6 +87,24 @@ class FeishuIMProvider:
                 f.write(response.file.read())
             return True
         logger.error(f"下载资源失败: {response.msg}")
+        return False
+
+    async def push_follow_up(self, message_id: str, content: str) -> bool:
+        """为指定消息推送跟随气泡"""
+        request = (
+            lark.im.v1.PushFollowUpMessageRequest.builder()
+            .message_id(message_id)
+            .request_body(
+                lark.im.v1.PushFollowUpMessageRequestBody.builder()
+                .content(json.dumps({"text": content}))
+                .build()
+            )
+            .build()
+        )
+        response = await self.client.im.v1.message.apush_follow_up(request)
+        if response.success():
+            return True
+        logger.error(f"推送跟随气泡失败: {response.msg}")
         return False
 
     async def get_message_content(self, message_id: str) -> Optional[str]:

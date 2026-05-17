@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     assistant_ttl: int = 3600  # 助理常驻时间 (秒)
     expert_ttl: int = 600      # 专家进程 TTL (秒)
     long_response_threshold: int = 150  # 触发文档化的字数阈值
+    follow_up_get: str = "Get"
+    follow_up_done: str = "Done"
     
     # 网络配置
     http_proxy: Optional[str] = None

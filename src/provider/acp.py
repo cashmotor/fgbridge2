@@ -27,11 +27,12 @@ class ACPProvider:
         self._req_id = 0
         self._lock = threading.Lock()
         self._is_running = False
+        self._active_session_id: Optional[str] = None # 内存热状态追踪
 
         # 用于存储 ACP 发送给 CLI 的请求信息
         self._pending_permissions: Dict[str, Dict] = {}
         
-        # 用于收集流式输出内容
+        # 用于收集流式输出内容 (增量)
         self._collected_content = ""
         self._collected_thought = ""
         self._collected_images: List[Dict[str, Any]] = []
@@ -50,8 +51,6 @@ class ACPProvider:
                 if not target_md.exists():
                     logger.info(f"正在部署引导文件: {template_path} -> {target_md}")
                     shutil.copy2(template_path, target_md)
-            else:
-                logger.warning(f"未找到 gemini.md 模板文件: {template_path}")
 
             args = [config.gemini_bin_path, "--acp"]
             if config.gemini_use_sandbox:
@@ -117,8 +116,10 @@ class ACPProvider:
         if not is_initializing:
             if not self._process or self._process.poll() is not None:
                 logger.warning("ACP 进程已退出，尝试重启...")
+                self._active_session_id = None # 进程退出，清空热状态
                 self.restart()
 
+        # 核心：精准裁剪。在发起新 Prompt 前清空缓冲区，只收集本次请求周期的增量内容
         if method == "session/prompt":
             self._collected_content = ""
             self._collected_thought = ""
@@ -195,6 +196,7 @@ class ACPProvider:
                                 if msg.get("id") == target_id:
                                     if method == "session/prompt":
                                         res = msg.setdefault("result", {})
+                                        # 将收集到的增量内容注入结果
                                         if self._collected_content: res["content"] = self._collected_content
                                         if self._collected_thought: res["thought"] = self._collected_thought
                                         if self._collected_images:
@@ -280,10 +282,16 @@ class ACPProvider:
         """创建新会话"""
         params = {"cwd": config.gemini_cwd, "mcpServers": []}
         resp = self._call("session/new", params)
-        return resp.get("result", {}).get("sessionId", "")
+        session_id = resp.get("result", {}).get("sessionId", "")
+        self._active_session_id = session_id # 标记为活跃
+        return session_id
 
     def session_load(self, session_id: str) -> bool:
         """利用 sessionId 加载 CLI 原生管理的记忆"""
+        if self._active_session_id == session_id:
+            logger.debug(f"Session {session_id} 已在内存中，跳过 Load 操作")
+            return True
+
         try:
             params = {
                 "sessionId": session_id,
@@ -291,7 +299,11 @@ class ACPProvider:
                 "mcpServers": []
             }
             resp = self._call("session/load", params)
-            return "error" not in resp
+            success = "error" not in resp
+            if success:
+                self._active_session_id = session_id # 加载成功，标记为活跃
+                logger.info(f"成功恢复热记忆: {session_id}")
+            return success
         except Exception as e:
             logger.error(f"加载会话异常: {e}")
             return False
@@ -355,7 +367,9 @@ class ACPProvider:
                 self._process.terminate()
                 self._process.wait(timeout=5)
             except Exception: self._process.kill()
-            finally: self._process, self._is_running = None, False
+            finally: 
+                self._process, self._is_running = None, False
+                self._active_session_id = None
 
     def restart(self) -> None:
         """重启 ACP"""

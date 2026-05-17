@@ -2,6 +2,7 @@ import json
 import base64
 import mimetypes
 import os
+from typing import Optional
 from loguru import logger
 from src.storage.state_store import StateStore
 from src.engine.dispatcher import ACPDispatcher
@@ -33,7 +34,15 @@ class Router:
         chat_type = message.get("chat_type") # "p2p" or "group"
         message_id = message.get("message_id")
         
+        # 1. 立即推送 Get 气泡反馈 (通过一条临时的回复消息)
+        ack_msg_id = None
+        if config.follow_up_get:
+            ack_msg_id = await self.feishu.reply(message_id, "⌛")
+            if ack_msg_id:
+                await self.feishu.push_follow_up(ack_msg_id, config.follow_up_get)
+
         thread_id = message.get("thread_id") or ""
+...
         root_id = message.get("root_id") or ""
         
         # 处理多模态附件
@@ -51,7 +60,6 @@ class Router:
         is_subtask = False
 
         if chat_type == "p2p":
-            # 1v1 模式：仅通过 thread_id 区分主轴和子任务
             if thread_id:
                 topic_id = thread_id
                 is_subtask = True
@@ -59,40 +67,30 @@ class Router:
                 topic_id = chat_id
                 target_role = config.assistant_role
         else:
-            # 群聊模式：
             if thread_id:
-                # 用户创建了话题 -> 专家子任务
                 topic_id = thread_id
                 is_subtask = True
             elif root_id:
-                # 针对某条消息的回复串 -> 寻回助理会话
                 topic_id = root_id
                 target_role = config.assistant_role
             else:
-                # 纯主轴第一次发言
                 topic_id = chat_id
                 target_role = config.assistant_role
 
-        # --- 核心修复：统一执行数据库寻回 ---
+        # --- 统一执行数据库寻回 ---
         topic = await self.store.get_topic(topic_id)
         
         if is_subtask:
-            # 处理专家子任务
             if not topic:
                 await self._bind_topic_and_route(chat_id, topic_id, message_id, text, attachments)
             else:
                 await self._route_to_role(topic["role"], chat_id, message_id, text, attachments, topic, topic_id)
         else:
-            # 处理助理主轴
             await self._route_to_role(target_role, chat_id, message_id, text, attachments, topic, topic_id)
 
     async def _process_attachments(self, message: dict) -> list:
-        """识别并下载消息中的图片/文件"""
         attachments = []
         message_id = message.get("message_id")
-        
-        # 飞书推送的资源 Key 在 message 结构中
-        # 兼容处理：SDK 转换后可能是 image_keys 或 file_keys
         image_keys = message.get("image_keys", [])
         file_keys = message.get("file_keys", [])
         
@@ -118,13 +116,9 @@ class Router:
         return attachments
 
     async def _bind_topic_and_route(self, chat_id: str, root_id: str, message_id: str, text: str, attachments: list):
-        # 1. 初始绑定：目前先硬编码 Developer
         role = "Developer" 
-        # 获取一个干净的会话 ID
         acp = self.dispatcher.get_acp(role)
         session_id = acp.session_new()
-        
-        # 保存并立即寻回，确保 topic 字典结构完整
         await self.store.save_topic(root_id, chat_id, role=role, session_id=session_id)
         topic = await self.store.get_topic(root_id)
         await self._route_to_role(role, chat_id, message_id, text, attachments, topic, root_id)
@@ -142,55 +136,41 @@ class Router:
         else:
             session_id = acp.session_new()
         
-        # 更新数据库 (记录最新的 session_id 和活跃时间)
         await self.store.save_topic(topic_id, chat_id, role=role, session_id=session_id)
-
-        # 发送请求
         resp = acp.send(session_id, text, attachments)
-        
-        # 响应后主动触发一次 CLI 原生保存
         acp.session_save(session_id)
         
-        await self._handle_acp_response(resp, chat_id, message_id, session_id, topic_id)
+        # 5. 发送正式回答并追加 Done 气泡
+        resp_msg_id = await self._handle_acp_response(resp, chat_id, message_id, session_id, topic_id)
+        if resp_msg_id and config.follow_up_done:
+            await self.feishu.push_follow_up(resp_msg_id, config.follow_up_done)
 
-    async def _handle_acp_response(self, resp: dict, chat_id: str, message_id: str, session_id: str, topic_id: str):
+    async def _handle_acp_response(self, resp: dict, chat_id: str, message_id: str, session_id: str, topic_id: str) -> Optional[str]:
         result = resp.get("result", {})
-        
         if result.get("type") == "confirmation_required":
             confirm_id = result.get("confirmationId")
             action = result.get("action")
             message = result.get("message")
-            
             await self.store.add_pending_confirm(confirm_id, topic_id, session_id, action, message)
             card_content = CardBuilder.build_permission_card(confirm_id, action, message)
-            await self.feishu.reply(message_id, card_content, msg_type="interactive")
+            return await self.feishu.reply(message_id, card_content, msg_type="interactive")
         else:
             content = result.get("content", str(result))
-            await self.feishu.reply(message_id, content)
+            return await self.feishu.reply(message_id, content)
 
     async def _handle_card_action(self, event_data: dict):
         action_value = event_data.get("action", {}).get("value", {})
         confirm_id = action_value.get("confirm_id")
         decision = action_value.get("decision")
-        
         if not confirm_id: return
-        
         pending = await self.store.get_pending_confirm(confirm_id)
         if not pending: return
-        
-        # 从数据库中寻回 Topic 判定角色
         topic = await self.store.get_topic(pending["topic_id"])
         role = topic["role"] if topic else config.assistant_role
-        
         acp = self.dispatcher.get_acp(role)
         resp = acp.confirm(pending["session_id"], confirm_id, decision)
-        
-        # 保存操作后的新记忆
         acp.session_save(pending["session_id"])
-        
         await self.store.remove_pending_confirm(confirm_id)
-        
-        # 更新卡片 UI
         new_card = CardBuilder.build_result_card(pending["action_type"], decision)
         await self.feishu.client.im.v1.message.apatch(
             lark.im.v1.PatchMessageRequest.builder()
@@ -198,5 +178,4 @@ class Router:
             .request_body(lark.im.v1.PatchMessageRequestBody.builder().content(new_card).build())
             .build()
         )
-        
         await self._handle_acp_response(resp, "", "", pending["session_id"], pending["topic_id"])

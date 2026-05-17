@@ -67,3 +67,31 @@ class CardBuilder:
             ]
         }
         return json.dumps(card, ensure_ascii=False)
+
+    @staticmethod
+    def build_system_status_card(status: str, time_str: str, role: str = "") -> str:
+        """构建系统启停通知卡片"""
+        is_ready = status.lower() == "ready"
+        title = "🚀 FGBridge 2.0 已就绪" if is_ready else "🛑 FGBridge 2.0 已停止"
+        template = "blue" if is_ready else "grey"
+        
+        content = f"**时间**: {time_str}"
+        if is_ready and role:
+            content += f"\n**当前助理角色**: {role}"
+            content += f"\n**模式**: WebSocket (长连接)"
+            
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "template": template,
+                "title": {"content": title, "tag": "plain_text"}
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {"content": content, "tag": "lark_md"}
+                }
+            ]
+        }
+        return json.dumps(card, ensure_ascii=False)
+

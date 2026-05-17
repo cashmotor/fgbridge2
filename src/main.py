@@ -9,16 +9,13 @@ from src.engine.dispatcher import ACPDispatcher
 from src.provider.feishu_im import FeishuIMProvider
 from src.engine.router import Router
 from src.listener.websocket import FeishuWebSocketListener
+from src.utils.card_builder import CardBuilder
 
 def setup_logging():
     """配置日志持久化"""
     from pathlib import Path
     log_path = Path(config.log_dir)
     
-    # 移除默认的控制台输出（如果需要自定义格式，否则可以保留）
-    # logger.remove() 
-    # logger.add(sys.stderr, level="INFO")
-
     # 1. 全量日志 (包括 ERROR)
     logger.add(
         log_path / "fgb.log",
@@ -77,27 +74,24 @@ async def main():
     event_queue = asyncio.Queue()
 
     # 2. 启动异步任务
-    # 将当前事件循环传递给监听器（以便在多线程中进行异步投递）
-    loop = asyncio.get_running_loop()
-    
     worker_task = asyncio.create_task(worker(event_queue, router))
     ttl_task = asyncio.create_task(cleanup_task(dispatcher))
 
     # 3. 在独立线程中启动飞书 WebSocket 监听器
     listener = FeishuWebSocketListener(event_queue)
-    # 修改 listener 内部逻辑以适应多线程环境已在 websocket.py 完成
     listener_thread = threading.Thread(target=listener.start, daemon=True)
     listener_thread.start()
 
     logger.success("FGBridge 2.0 服务已全面启动")
     
-    # 4. Say Hi (启动通知)
+    # 4. Say Hi (启动通知卡片)
     if config.feishu_user_id:
         from datetime import datetime
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        card_content = CardBuilder.build_system_status_card("ready", now, config.assistant_role)
         await feishu.send_text(
             config.feishu_user_id, 
-            f"🚀 FGBridge 2.0 已就绪\n启动时间: {now}\n当前助理角色: {config.assistant_role}",
+            card_content,
             receive_id_type="open_id"
         )
 
@@ -106,15 +100,17 @@ async def main():
     except asyncio.CancelledError:
         logger.info("服务正在关闭...")
     finally:
-        # 5. Say Hi (停止通知)
+        # 5. Say Hi (停止通知卡片)
         if config.feishu_user_id:
+            from datetime import datetime
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             logger.info("正在发送停止通知...")
             try:
+                card_content = CardBuilder.build_system_status_card("stopped", now)
                 # 使用 shield 保护发送动作，防止在取消过程中被打断
                 await asyncio.shield(feishu.send_text(
                     config.feishu_user_id, 
-                    f"🛑 FGBridge 2.0 已停止服务\n停止时间: {now}",
+                    card_content,
                     receive_id_type="open_id"
                 ))
             except Exception as e:
