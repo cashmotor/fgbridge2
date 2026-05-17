@@ -10,12 +10,17 @@
 
 ### 2.1 响应内容精准裁剪 (Response Trimming)
 **背景**：Gemini ACP 模式在 `session/prompt` 响应中可能包含部分历史上下文。为确保飞书前端体验，必须仅转发本次新增的生成内容。
-**方案**：
-- **逻辑位置**：`src/provider/acp.py` 中的 `_read_until` 或 `send` 方法。
-- **实现机制**：利用 ACP 协议中的流式通知 `agent_message_chunk`。
-  - 在发送 `prompt` 前清空 `_collected_content` 缓冲区。
-  - 仅累加当前请求周期内收到的 `chunk`。
-  - 确保返回给 `Router` 的结果仅包含该次增量文本。
+
+**方案实现细节**：
+- **逻辑位置**：`src/provider/acp.py` 中的 `_read_until` 处理逻辑。
+- **双重保障机制**：
+  1. **流式累加 (Primary)**：利用 ACP 协议中的 `agent_message_chunk` 通知。在发送 `prompt` 前清空 `_collected_content`，仅在当前请求周期内累加收到的 chunk。
+  2. **全量差分 (Fallback)**：在 `ACPProvider` 中维护 `_session_full_contents` 字典，记录每个 Session 上一次返回的全量文本。若当前请求未捕获到有效 chunk，则将响应包中的全量 `content` 与上一轮记录进行字符串前缀匹配（`startswith`），截取出增量部分。
+  3. **持久化基准 (Cross-Restart Persistence)**：为解决 FGB 重启后首条消息无法裁剪的问题，在 `StateStore.topics` 表中引入 `last_full_content` 字段。
+     - **存储**：每轮对话结束后，将当前最新的全量内容持久化到数据库。
+     - **寻回**：在 `session_load` 成功后，由 `Router` 将数据库中的历史基准重新注入 `ACPProvider` 内存。
+- **状态同步**：在 `session_new` 或 `session_load` 时自动重置或还原对应 Session 的内容基准，确保差分计算的准确性。
+- **收益**：彻底消除飞书端的回复冗余，显著提升对话的丝滑感。
 
 ### 2.2 授权卡片自动失效机制
 **背景**：防止用户忽略旧授权卡片直接提问，导致后续误触历史高危按钮。

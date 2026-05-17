@@ -31,11 +31,12 @@
 - [x] 编写飞书互动卡片构造器 (src/utils/card_builder.py) @med (2026-05-16)
 - [x] 实现高危操作的 WebSocket 回调拦截与处理逻辑 @high (2026-05-16)
 - [ ] 多模态附件（图片/文件）的流水线处理逻辑 @med
-- [ ] Say Hi消息改为卡片模式 @med
-- [ ] 接收到用户消息后，在对应用户消息上添加‘get’气泡（方法参见https://open.feishu.cn/document/im-v1/message/push_follow_up） @med
+- [x] Say Hi消息改为卡片模式 @med (2026-05-17)
+- [x] 接收和回复用户消息时，在对应用户消息上添加‘get’和‘done’表情回复 @med (2026-05-17)
 
 ## [优化与打磨]
-- [ ] 专家进程的惰性退出 TTL 机制实现 @med
+- [x] 专家进程的惰性退出 TTL 机制实现 @med (2026-05-17)
 - [ ] Gemini Context Caching 性能优化支持 @low
 - [ ] 结构化日志记录与错误追溯系统 @med
-- [ ] acp回复给lark的消息会携带session历史，需要trim只回复最新添加的内容 @high
+- [x] acp回复给lark的消息会携带session历史，需要trim只回复最新添加的内容 @high (2026-05-17)
+- [ ] fgb重启后，以及已有话题重新唤醒后，acp回复仍旧会携带session历史 @high

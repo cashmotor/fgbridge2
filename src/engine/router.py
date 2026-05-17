@@ -34,15 +34,7 @@ class Router:
         chat_type = message.get("chat_type") # "p2p" or "group"
         message_id = message.get("message_id")
         
-        # 1. 立即推送 Get 气泡反馈 (通过一条临时的回复消息)
-        ack_msg_id = None
-        if config.follow_up_get:
-            ack_msg_id = await self.feishu.reply(message_id, "⌛")
-            if ack_msg_id:
-                await self.feishu.push_follow_up(ack_msg_id, config.follow_up_get)
-
         thread_id = message.get("thread_id") or ""
-...
         root_id = message.get("root_id") or ""
         
         # 处理多模态附件
@@ -77,6 +69,13 @@ class Router:
                 topic_id = chat_id
                 target_role = config.assistant_role
 
+        # 1. 核心增强：授权卡片自动失效逻辑
+        await self._auto_expire_pending_confirms(topic_id)
+
+        # 2. 状态反馈：添加 GET 表情 (如 OK)
+        if config.reaction_get:
+            await self.feishu.add_reaction(message_id, config.reaction_get)
+
         # --- 统一执行数据库寻回 ---
         topic = await self.store.get_topic(topic_id)
         
@@ -84,9 +83,17 @@ class Router:
             if not topic:
                 await self._bind_topic_and_route(chat_id, topic_id, message_id, text, attachments)
             else:
-                await self._route_to_role(topic["role"], chat_id, message_id, text, attachments, topic, topic_id)
+                await self._route_to_role(topic["role"], chat_id, message_id, text, attachments, topic, topic_id, message_id)
         else:
-            await self._route_to_role(target_role, chat_id, message_id, text, attachments, topic, topic_id)
+            await self._route_to_role(target_role, chat_id, message_id, text, attachments, topic, topic_id, message_id)
+
+    async def _auto_expire_pending_confirms(self, topic_id: str):
+        """自动失效指定话题下的所有挂起授权"""
+        pendings = await self.store.get_pending_confirms_by_topic(topic_id)
+        for p in pendings:
+            if p.get("action_type"): # 这是一个真正的授权请求
+                logger.info(f"检测到新消息，自动失效旧授权: {p['confirm_id']}")
+            await self.store.remove_pending_confirm(p["confirm_id"])
 
     async def _process_attachments(self, message: dict) -> list:
         attachments = []
@@ -112,18 +119,17 @@ class Router:
                     "type": "resource_link",
                     "uri": f"file://{os.path.abspath(save_path)}"
                 })
-
         return attachments
 
-    async def _bind_topic_and_route(self, chat_id: str, root_id: str, message_id: str, text: str, attachments: list):
+    async def _bind_topic_and_route(self, chat_id: str, topic_id: str, message_id: str, text: str, attachments: list):
         role = "Developer" 
         acp = self.dispatcher.get_acp(role)
         session_id = acp.session_new()
-        await self.store.save_topic(root_id, chat_id, role=role, session_id=session_id)
-        topic = await self.store.get_topic(root_id)
-        await self._route_to_role(role, chat_id, message_id, text, attachments, topic, root_id)
+        await self.store.save_topic(topic_id, chat_id, role=role, session_id=session_id)
+        topic = await self.store.get_topic(topic_id)
+        await self._route_to_role(role, chat_id, message_id, text, attachments, topic, topic_id, message_id)
 
-    async def _route_to_role(self, role: str, chat_id: str, message_id: str, text: str, attachments: list, topic: dict, topic_id: str):
+    async def _route_to_role(self, role: str, chat_id: str, message_id: str, text: str, attachments: list, topic: dict, topic_id: str, origin_msg_id: str):
         acp = self.dispatcher.get_acp(role)
         session_id = None
 
@@ -133,17 +139,44 @@ class Router:
             if not acp.session_load(session_id):
                 logger.warning(f"记忆寻回失败 (可能已被 CLI 清理)，将作为新会话处理")
                 session_id = acp.session_new()
+            else:
+                # 核心修复：还原响应裁剪的基准内容
+                last_content = topic.get("last_full_content")
+                if last_content:
+                    # 确保是字符串类型以规避 len() 报错
+                    last_content_str = str(last_content)
+                    acp._session_full_contents[session_id] = last_content_str
+                    logger.debug(f"已还原 Session {session_id} 的裁剪基准 (长度: {len(last_content_str)})")
         else:
             session_id = acp.session_new()
-        
+
+        # 记录请求前的状态
         await self.store.save_topic(topic_id, chat_id, role=role, session_id=session_id)
+
+        # 发送请求
         resp = acp.send(session_id, text, attachments)
         acp.session_save(session_id)
+
+        # 核心增强：持久化最新的全量内容，供下次 FGB 重启后寻回
+        new_full_content = acp._session_full_contents.get(session_id, "")
+        if new_full_content:
+            await self.store.save_topic(topic_id, chat_id, last_full_content=new_full_content)
+
+        # 5. 发送正式回答
+        await self._handle_acp_response(resp, chat_id, origin_msg_id, session_id, topic_id)
         
-        # 5. 发送正式回答并追加 Done 气泡
-        resp_msg_id = await self._handle_acp_response(resp, chat_id, message_id, session_id, topic_id)
-        if resp_msg_id and config.follow_up_done:
-            await self.feishu.push_follow_up(resp_msg_id, config.follow_up_done)
+        # 6. 完成反馈：删除 GET，添加 DONE
+        await self._finalize_reaction(origin_msg_id)
+
+    async def _finalize_reaction(self, message_id: str):
+        """流转表情状态：即时寻址删除 GET，添加 DONE"""
+        # 1. 尝试删除 GET (OK)
+        if config.reaction_get:
+            await self.feishu.delete_bot_reaction_by_type(message_id, config.reaction_get)
+            
+        # 2. 添加 DONE
+        if config.reaction_done:
+            await self.feishu.add_reaction(message_id, config.reaction_done)
 
     async def _handle_acp_response(self, resp: dict, chat_id: str, message_id: str, session_id: str, topic_id: str) -> Optional[str]:
         result = resp.get("result", {})
