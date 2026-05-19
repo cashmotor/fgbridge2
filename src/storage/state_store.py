@@ -21,16 +21,20 @@ class StateStore:
                     role TEXT,
                     session_id TEXT,
                     last_full_content TEXT,
+                    turn_count INTEGER DEFAULT 0,
                     last_active_time INTEGER
                 )
             """)
             
-            # --- 自动升级：为 topics 表添加 last_full_content 字段 ---
+            # --- 自动升级：检查缺失字段 ---
             async with db.execute("PRAGMA table_info(topics)") as cursor:
                 columns = [row[1] for row in await cursor.fetchall()]
                 if "last_full_content" not in columns:
                     logger.info("数据库升级: 为 topics 表添加 last_full_content 字段")
                     await db.execute("ALTER TABLE topics ADD COLUMN last_full_content TEXT")
+                if "turn_count" not in columns:
+                    logger.info("数据库升级: 为 topics 表添加 turn_count 字段")
+                    await db.execute("ALTER TABLE topics ADD COLUMN turn_count INTEGER DEFAULT 0")
             
             # 2. 挂起的确认请求表 (基础结构)
             await db.execute("""
@@ -61,37 +65,34 @@ class StateStore:
             async with db.execute("SELECT * FROM topics WHERE topic_id = ?", (topic_id,)) as cursor:
                 row = await cursor.fetchone()
                 if row:
-                    content = row["last_full_content"]
-                    # 防御性逻辑：如果数据库里是空数字或空值，强制转为 None
-                    if not content or content == 0 or content == "0":
-                        content = None
-                        
                     return {
                         "topic_id": row["topic_id"],
                         "scope_id": row["scope_id"],
                         "role": row["role"],
                         "session_id": row["session_id"],
-                        "last_full_content": content,
+                        "last_full_content": row["last_full_content"],
+                        "turn_count": row["turn_count"] or 0,
                         "last_active_time": row["last_active_time"]
                     }
                 return None
 
-    async def save_topic(self, topic_id: str, scope_id: str, role: str = None, session_id: str = None, last_full_content: str = None):
+    async def save_topic(self, topic_id: str, scope_id: str, role: str = None, session_id: str = None, last_full_content: str = None, turn_count: int = None):
         if last_full_content:
             logger.debug(f"正在保存话题 {topic_id} 的全量内容，长度: {len(last_full_content)}")
             
         async with aiosqlite.connect(self.db_path) as db:
             # 使用 ON CONFLICT 增量更新，确保原有字段不被 NULL 覆盖
             await db.execute("""
-                INSERT INTO topics (topic_id, scope_id, role, session_id, last_full_content, last_active_time)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO topics (topic_id, scope_id, role, session_id, last_full_content, turn_count, last_active_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(topic_id) DO UPDATE SET
                     scope_id=excluded.scope_id,
                     role=COALESCE(excluded.role, topics.role),
                     session_id=COALESCE(excluded.session_id, topics.session_id),
                     last_full_content=COALESCE(excluded.last_full_content, topics.last_full_content),
+                    turn_count=COALESCE(excluded.turn_count, topics.turn_count),
                     last_active_time=excluded.last_active_time
-            """, (topic_id, scope_id, role, session_id, last_full_content, int(time.time())))
+            """, (topic_id, scope_id, role, session_id, last_full_content, turn_count, int(time.time())))
             await db.commit()
 
     # --- Pending Confirms 管理 ---

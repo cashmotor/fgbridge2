@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     gemini_md_template_path: str = "gemini.md" # 模板文件路径
     gemini_use_sandbox: bool = True
     gemini_use_yolo: bool = False
+    acp_silent_flush_enabled: bool = True
+    acp_silent_flush_prompt: str = "Hi"
     
     # 存储配置
     db_path: str = "data/fgbridge.db"

@@ -132,47 +132,51 @@ class Router:
     async def _route_to_role(self, role: str, chat_id: str, message_id: str, text: str, attachments: list, topic: dict, topic_id: str, origin_msg_id: str):
         acp = self.dispatcher.get_acp(role)
         session_id = None
+        turn_count = (topic.get("turn_count") or 0) if topic else 0
+        
+        # 识别是否需要注入防回显指令 (仅在物理 Load 时执行)
+        is_cold_start = False
 
         if topic and topic.get("session_id"):
             session_id = topic["session_id"]
-            logger.info(f"检测到历史会话: {session_id} (Role: {role})")
+            logger.info(f"检测到历史会话: {session_id} (Role: {role}, Turn: {turn_count})")
             
-            # Debug: 数据库读取详情
-            raw_base = topic.get("last_full_content")
-            logger.debug(f"数据库中读取到的基准长度: {len(str(raw_base)) if raw_base else 'None'}")
-
-            if not acp.session_load(session_id):
-                logger.warning(f"记忆寻回失败 (可能已被 CLI 清理)，将作为新会话处理")
-                session_id = acp.session_new()
-            else:
-                # 还原响应裁剪的基准内容
-                if raw_base:
-                    acp._session_full_contents[session_id] = str(raw_base)
-                    preview = acp._session_full_contents[session_id][:50].replace("\n", " ")
-                    logger.success(f"已还原 Session {session_id} 的裁剪基准 (长度: {len(acp._session_full_contents[session_id])}, 预览: {preview}...)")
+            if acp._active_session_id != session_id:
+                if not acp.session_load(session_id):
+                    logger.warning(f"Session {session_id} 载入失败，正在创建新会话")
+                    session_id = acp.session_new()
+                    turn_count = 0
                 else:
-                    logger.warning(f"Session {session_id} 无历史基准记录")
+                    is_cold_start = True
         else:
-            logger.info(f"新话题 {topic_id}，创建新会话")
+            logger.info(f"新话题 {topic_id}，正在创建新会话")
             session_id = acp.session_new()
+            turn_count = 0
         
-        # 记录请求前的状态 (确保不传递空 content 导致 COALESCE 失效)
-        await self.store.save_topic(topic_id, chat_id, role=role, session_id=session_id, last_full_content=None)
+        # 1. 增加回合数
+        turn_count += 1
         
-        # 发送请求
+        # 2. 预保存状态
+        await self.store.save_topic(topic_id, chat_id, role=role, session_id=session_id, turn_count=turn_count)
+        
+        # 3. 处理冷启动：执行静默刷 (History Flush)
+        if is_cold_start and config.acp_silent_flush_enabled:
+            logger.info(f"Session {session_id} 触发回显历史冲刷 (Silent Flush: {config.acp_silent_flush_prompt})...")
+            # 同步发送一个简单的 prompt 以引出并消耗掉回显的历史消息
+            try:
+                acp.send(session_id, config.acp_silent_flush_prompt)
+                logger.debug("历史冲刷完成，准备处理用户正式指令")
+            except Exception as e:
+                logger.error(f"历史冲刷执行异常: {e}")
+
+        # 4. 发送正式请求
         resp = acp.send(session_id, text, attachments)
         acp.session_save(session_id)
         
-        # 核心增强：持久化最新的全量内容
-        new_full_content = resp.get("result", {}).get("full_content_for_persistence")
-        if new_full_content:
-            await self.store.save_topic(topic_id, chat_id, last_full_content=new_full_content)
-            logger.debug(f"已持久化话题 {topic_id} 的全量基准 (长度: {len(new_full_content)})")
-
         # 5. 发送正式回答
         await self._handle_acp_response(resp, chat_id, origin_msg_id, session_id, topic_id)
         
-        # 6. 完成反馈：删除 GET，添加 DONE
+        # 6. 完成反馈
         await self._finalize_reaction(origin_msg_id)
 
     async def _finalize_reaction(self, message_id: str):

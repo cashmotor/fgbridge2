@@ -32,13 +32,10 @@ class ACPProvider:
         # 用于存储 ACP 发送给 CLI 的请求信息
         self._pending_permissions: Dict[str, Dict] = {}
         
-        # 核心：精准裁剪相关状态
+        # 核心相关状态
         self._collected_content = ""
         self._collected_thought = ""
         self._collected_images: List[Dict[str, Any]] = []
-        
-        # 记录每个 session 的权威全量内容 (用于裁剪基准)
-        self._session_full_contents: Dict[str, str] = {}
 
     def start(self, system_prompt: str = None) -> None:
         """启动 gemini --acp 子进程并完成初始化握手"""
@@ -162,58 +159,29 @@ class ACPProvider:
                                 if msg.get("id") == target_id:
                                     if method == "session/prompt":
                                         res = msg.setdefault("result", {})
-                                        sid = self._current_prompt_session_id
-                                        last_full = self._session_full_contents.get(sid, "")
                                         
-                                        # 1. 获取原始内容
-                                        raw_content = res.get("content", "")
+                                        # 原生回合模式：优先使用流式增量
                                         streamed = self._collected_content.strip()
+                                        raw_content = res.get("content", "").strip()
                                         
-                                        # 2. 识别增量与全量
-                                        # 如果流式收集到了内容，优先认为它是增量
                                         if streamed:
-                                            delta = streamed
-                                            # 合成用于持久化的全量基准: 移除手动 \n，由 CLI 决定拼接方式
-                                            current_full = last_full + delta if last_full else delta
-                                            logger.debug(f"[Trim] 识别为流式增量模式, 增量长度: {len(delta)}")
+                                            # 策略 A: 使用流式增量 (最可靠)
+                                            final_content = self._strip_tags(streamed)
+                                            logger.debug(f"[ACP] 使用流式增量内容, 长度: {len(final_content)}")
+                                        elif raw_content:
+                                            # 策略 B: 使用返回的 content (通常也是当前回合)
+                                            final_content = self._strip_tags(raw_content)
+                                            logger.debug(f"[ACP] 使用直接返回内容, 长度: {len(final_content)}")
                                         else:
-                                            # 如果没有流式内容，检查 raw_content 是否包含历史
-                                            # 策略 A: 原始匹配
-                                            if last_full and last_full in raw_content:
-                                                _, delta = raw_content.rsplit(last_full, 1)
-                                                current_full = raw_content
-                                                logger.debug(f"[Trim] 识别为全量回显模式: 原始基准完全匹配")
-                                            else:
-                                                # 策略 B: 换行不敏感匹配
-                                                norm_raw = self._strip_tags(raw_content, compress_ws=True)
-                                                norm_base = self._strip_tags(last_full, compress_ws=True)
-                                                
-                                                if norm_base and norm_base in norm_raw:
-                                                    # 压缩后匹配成功，说明仅存在换行差异
-                                                    delta = raw_content[len(last_full):] if len(raw_content) > len(last_full) else raw_content
-                                                    current_full = raw_content
-                                                    logger.warning(f"[Trim] 识别为全量回显模式: 原始不匹配但压缩匹配，执行截断")
-                                                else:
-                                                    # 策略 C: 兜底与自愈 (Self-Healing)
-                                                    delta = raw_content
-                                                    # 启发式判断：如果收到的回复长度 > 现有基准的 50%，认为它更可能是全量回显
-                                                    # 此时重置基准，防止数据库记录无限叠加
-                                                    if last_full and len(raw_content) > len(last_full) * 0.5:
-                                                        current_full = raw_content
-                                                        logger.error(f"[Trim] 匹配彻底失败且内容较长，触发自愈：重置基准以防止雪球效应")
-                                                    else:
-                                                        current_full = last_full + delta if last_full else delta
-                                                        logger.debug(f"[Trim] 识别为独立回复模式")
-                                        
-                                        # 3. 最终处理并注入
-                                        # 注意：final_content 用于发送给飞书，只需剔除标签
-                                        final_content = self._strip_tags(delta, compress_ws=False)
+                                            final_content = ""
+                                            logger.warning("[ACP] 回合响应内容为空")
+
                                         res["content"] = final_content
-                                        res["full_content_for_persistence"] = current_full
-                                        if self._collected_thought: res["thought"] = self._collected_thought
+                                        # 保持接口兼容，但在原生模式下不再强行合成历史
+                                        res["full_content_for_persistence"] = final_content 
                                         
-                                        if sid: self._session_full_contents[sid] = current_full
-                                        logger.success(f"响应处理完成: 最终增量长度 {len(final_content)}, 数据库基准总长 {len(current_full)}")
+                                        if self._collected_thought: res["thought"] = self._collected_thought
+                                        logger.success(f"回合响应处理完成: 长度 {len(final_content)}")
                                         
                                     return msg
                                 
@@ -286,7 +254,6 @@ class ACPProvider:
         resp = self._call("session/new", params)
         session_id = resp.get("result", {}).get("sessionId", "")
         self._active_session_id = session_id
-        if session_id: self._session_full_contents[session_id] = ""
         return session_id
 
     def session_load(self, session_id: str) -> bool:
@@ -297,7 +264,6 @@ class ACPProvider:
             success = "error" not in resp
             if success:
                 self._active_session_id = session_id
-                self._session_full_contents[session_id] = ""
             return success
         except: return False
 

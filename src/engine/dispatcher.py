@@ -11,6 +11,7 @@ class ACPDispatcher:
     ACP 进程调度池，管理不同角色的 ACP 进程及其生命周期 (TTL)
     """
     def __init__(self):
+        # self.pool类型说明（key -> value）
         # role -> {provider: ACPProvider, last_active: float}
         self.pool: Dict[str, Dict] = {}
         self._role_prompts: Dict[str, str] = self._load_role_prompts()

@@ -70,6 +70,20 @@
     - 引入了 `aiosqlite.Row` 具名列读取机制，提升了存储层的健壮性。
     - 明确了“全量基准存储”逻辑：数据库始终保存未裁剪的完整上下文，以确保重启后能通过 `rsplit` 精准切出增量回复。
 
+## [2026-05-19] 架构跃迁：全面转向“原生回合模式”
+
+### Done
+- **架构重构**:
+    - 废弃了基于文本差分的裁剪引擎，转向由 `session_id` 驱动的 **原生回合模式 (Native Turn-based Mode)**。
+    - 删除了 `ACPProvider` 中所有关于 `last_full_content` 的手动合成与还原逻辑，彻底消除格式微差导致的裁剪失效风险。
+    - 确立了以 `agent_message_chunk` (流式增量) 为核心的响应获取策略。
+- **状态追踪升级**:
+    - 在数据库 `topics` 表中引入了 `turn_count` 字段，实现对话回合的显式追踪与持久化。
+    - 简化了 `Router` 逻辑：重启后仅需通过 `session_load` 唤醒记忆，Gemini CLI 内部机制将自动确保响应的增量纯净性。
+- **历史回显深度防御**:
+    - 实现了 **“静默刷 (Silent Flush)”** 机制：针对 ACP 模式在冷启动后首次 `prompt` 强制回显历史的问题，通过预先发送一个配置化的静默消息（如 "Hi"）来物理级消耗掉历史缓冲区。
+    - 在 `config.py` 中增加了 `acp_silent_flush_enabled` 和 `acp_silent_flush_prompt` 配置项，增强了系统的灵活性。
+
 
 
 
