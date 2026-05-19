@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import threading
 import time
+import re
 from typing import Any, Dict, List, Optional
 from pathlib import Path
 
@@ -36,7 +37,7 @@ class ACPProvider:
         self._collected_thought = ""
         self._collected_images: List[Dict[str, Any]] = []
         
-        # 记录每个 session 上次的完整内容，用于强制差分兜底
+        # 记录每个 session 的权威全量内容 (用于裁剪基准)
         self._session_full_contents: Dict[str, str] = {}
 
     def start(self, system_prompt: str = None) -> None:
@@ -53,28 +54,19 @@ class ACPProvider:
                     shutil.copy2(template_path, target_md)
 
             args = [config.gemini_bin_path, "--acp"]
-            if config.gemini_use_sandbox:
-                args.append("--sandbox")
-            if config.gemini_use_yolo:
-                args.append("--yolo")
+            if config.gemini_use_sandbox: args.append("--sandbox")
+            if config.gemini_use_yolo: args.append("--yolo")
 
             logger.info(f"正在启动 ACP 进程: {' '.join(args)} (cwd: {target_cwd})")
 
             env = os.environ.copy()
             for proxy in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"]:
                 val = getattr(config, proxy.lower(), None)
-                if val:
-                    env[proxy] = val
+                if val: env[proxy] = val
 
             self._process = subprocess.Popen(
-                args,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=False,
-                bufsize=0,
-                env=env,
-                cwd=str(target_cwd),
+                args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=False, bufsize=0, env=env, cwd=str(target_cwd),
             )
             self._is_running = True
 
@@ -82,16 +74,11 @@ class ACPProvider:
                 logger.info("等待沙箱环境初始化 (3s)...")
                 time.sleep(3)
 
-            # 执行初始化握手
-            capabilities = {
-                "promptCapabilities": {"image": True, "audio": True},
-                "mcpCapabilities": {"http": True}
-            }
+            capabilities = {"promptCapabilities": {"image": True, "audio": True}, "mcpCapabilities": {"http": True}}
             params = {"protocolVersion": 1, "capabilities": capabilities}
-            if system_prompt:
-                params["systemInstruction"] = system_prompt
+            if system_prompt: params["systemInstruction"] = system_prompt
 
-            resp = self._call("initialize", params, is_initializing=True)
+            self._call("initialize", params, is_initializing=True)
             logger.success(f"ACP 进程初始化成功")
 
         except Exception as e:
@@ -99,13 +86,7 @@ class ACPProvider:
             logger.error(f"ACP 进程启动失败: {e}")
             raise ACPError(f"无法启动 ACP 进程: {e}")
 
-    def _call(
-            self,
-            method: str,
-            params: Dict[str, Any],
-            timeout: int = 300,
-            is_initializing: bool = False,
-    ) -> Dict[str, Any]:
+    def _call(self, method: str, params: Dict[str, Any], timeout: int = 300, is_initializing: bool = False) -> Dict[str, Any]:
         """发送 JSON-RPC 请求并同步等待响应"""
         if not is_initializing:
             if not self._process or self._process.poll() is not None:
@@ -113,7 +94,6 @@ class ACPProvider:
                 self._active_session_id = None
                 self.restart()
 
-        # 发起新 Prompt 前彻底重置增量收集缓冲区
         if method == "session/prompt":
             self._collected_content = ""
             self._collected_thought = ""
@@ -125,12 +105,7 @@ class ACPProvider:
                 self._last_prompt_req_id = self._req_id
                 self._current_prompt_session_id = params.get("sessionId")
 
-            request = {
-                "jsonrpc": "2.0",
-                "id": self._req_id,
-                "method": method,
-                "params": params,
-            }
+            request = {"jsonrpc": "2.0", "id": self._req_id, "method": method, "params": params}
 
             try:
                 payload = (json.dumps(request) + "\n").encode("utf-8")
@@ -140,15 +115,23 @@ class ACPProvider:
                     self._process.stdin.flush()
                 else:
                     raise ACPError("ACP 进程标准输入流不可用")
-
                 return self._read_until(self._req_id, method, timeout)
-
             except Exception as e:
                 logger.error(f"ACP 通信异常: {e}")
                 raise ACPError(f"ACP 通信失败: {e}")
 
+    def _strip_tags(self, text: str, compress_ws: bool = False) -> str:
+        """归一化：剔除数字标签，可选压缩所有空白字符以适配匹配"""
+        if not text: return ""
+        # 1. 剔除数字标签
+        text = re.sub(r"\d+[:\s]+", "", text)
+        if compress_ws:
+            # 2. 压缩所有空白字符（换行、空格等）彻底消除格式差异
+            text = re.sub(r"\s+", "", text)
+        return text.strip()
+
     def _read_until(self, target_id: int, method: str, timeout: int) -> Dict[str, Any]:
-        """流式读取输出直到获得目标响应，并执行增量内容提取"""
+        """流式读取输出直到获得目标响应，并执行增强型融合裁剪算法"""
         start_time = time.time()
         stdout_buffer = b""
 
@@ -176,39 +159,67 @@ class ACPProvider:
 
                             try:
                                 msg = json.loads(line)
-                                # 匹配成功：处理最终结果
                                 if msg.get("id") == target_id:
                                     if method == "session/prompt":
                                         res = msg.setdefault("result", {})
-                                        full_content = res.get("content", "")
                                         sid = self._current_prompt_session_id
+                                        last_full = self._session_full_contents.get(sid, "")
                                         
-                                        # --- 核心逻辑：增量内容判定 ---
-                                        delta = ""
-                                        if self._collected_content:
-                                            # 1. 优先使用流式累加的内容
-                                            delta = self._collected_content
-                                        elif full_content:
-                                            # 2. 兜底逻辑：计算全量差分
-                                            last_full = self._session_full_contents.get(sid, "")
-                                            if full_content.startswith(last_full):
-                                                delta = full_content[len(last_full):].strip()
+                                        # 1. 获取原始内容
+                                        raw_content = res.get("content", "")
+                                        streamed = self._collected_content.strip()
+                                        
+                                        # 2. 识别增量与全量
+                                        # 如果流式收集到了内容，优先认为它是增量
+                                        if streamed:
+                                            delta = streamed
+                                            # 合成用于持久化的全量基准: 移除手动 \n，由 CLI 决定拼接方式
+                                            current_full = last_full + delta if last_full else delta
+                                            logger.debug(f"[Trim] 识别为流式增量模式, 增量长度: {len(delta)}")
+                                        else:
+                                            # 如果没有流式内容，检查 raw_content 是否包含历史
+                                            # 策略 A: 原始匹配
+                                            if last_full and last_full in raw_content:
+                                                _, delta = raw_content.rsplit(last_full, 1)
+                                                current_full = raw_content
+                                                logger.debug(f"[Trim] 识别为全量回显模式: 原始基准完全匹配")
                                             else:
-                                                delta = full_content # 无法差分，回退到全量
+                                                # 策略 B: 换行不敏感匹配
+                                                norm_raw = self._strip_tags(raw_content, compress_ws=True)
+                                                norm_base = self._strip_tags(last_full, compress_ws=True)
+                                                
+                                                if norm_base and norm_base in norm_raw:
+                                                    # 压缩后匹配成功，说明仅存在换行差异
+                                                    delta = raw_content[len(last_full):] if len(raw_content) > len(last_full) else raw_content
+                                                    current_full = raw_content
+                                                    logger.warning(f"[Trim] 识别为全量回显模式: 原始不匹配但压缩匹配，执行截断")
+                                                else:
+                                                    # 策略 C: 兜底与自愈 (Self-Healing)
+                                                    delta = raw_content
+                                                    # 启发式判断：如果收到的回复长度 > 现有基准的 50%，认为它更可能是全量回显
+                                                    # 此时重置基准，防止数据库记录无限叠加
+                                                    if last_full and len(raw_content) > len(last_full) * 0.5:
+                                                        current_full = raw_content
+                                                        logger.error(f"[Trim] 匹配彻底失败且内容较长，触发自愈：重置基准以防止雪球效应")
+                                                    else:
+                                                        current_full = last_full + delta if last_full else delta
+                                                        logger.debug(f"[Trim] 识别为独立回复模式")
                                         
-                                        # 注入裁剪后的增量
-                                        res["content"] = delta
+                                        # 3. 最终处理并注入
+                                        # 注意：final_content 用于发送给飞书，只需剔除标签
+                                        final_content = self._strip_tags(delta, compress_ws=False)
+                                        res["content"] = final_content
+                                        res["full_content_for_persistence"] = current_full
                                         if self._collected_thought: res["thought"] = self._collected_thought
                                         
-                                        # 更新记忆以便下次差分
-                                        if sid: self._session_full_contents[sid] = full_content
+                                        if sid: self._session_full_contents[sid] = current_full
+                                        logger.success(f"响应处理完成: 最终增量长度 {len(final_content)}, 数据库基准总长 {len(current_full)}")
                                         
                                     return msg
                                 
                                 if "method" in msg and "id" not in msg:
                                     self._handle_notification(msg)
                                     continue
-
                                 if "method" in msg and "id" in msg:
                                     if msg["method"] == "session/request_permission":
                                         return self._handle_permission_request(msg)
@@ -248,9 +259,7 @@ class ACPProvider:
         options = params.get("options", [])
         confirmation_id = tool_call.get("toolCallId") or f"perm_{int(time.time())}"
 
-        self._pending_permissions[confirmation_id] = {
-            "rpc_id": rpc_id, "session_id": session_id, "options": options
-        }
+        self._pending_permissions[confirmation_id] = {"rpc_id": rpc_id, "session_id": session_id, "options": options}
         logger.info(f"收到 ACP 权限请求: {confirmation_id}")
 
         return {
@@ -277,7 +286,6 @@ class ACPProvider:
         resp = self._call("session/new", params)
         session_id = resp.get("result", {}).get("sessionId", "")
         self._active_session_id = session_id
-        # 初始化该 session 的全量内容为空
         if session_id: self._session_full_contents[session_id] = ""
         return session_id
 
@@ -289,8 +297,6 @@ class ACPProvider:
             success = "error" not in resp
             if success:
                 self._active_session_id = session_id
-                # 加载成功后，我们需要通过一次空 prompt 或特殊方式获取当前全量内容
-                # 此处暂时置空，依靠下一次 prompt 的首次全量作为基准
                 self._session_full_contents[session_id] = ""
             return success
         except: return False

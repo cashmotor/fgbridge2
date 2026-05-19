@@ -37,6 +37,12 @@
 ## [优化与打磨]
 - [x] 专家进程的惰性退出 TTL 机制实现 @med (2026-05-17)
 - [ ] Gemini Context Caching 性能优化支持 @low
+- [ ] 优化持久化基准存储 (方案 B)：将 last_full_content 从数据库迁移至外部快照文件 (.full)，以减轻 SQLite 负担 @low
 - [ ] 结构化日志记录与错误追溯系统 @med
 - [x] acp回复给lark的消息会携带session历史，需要trim只回复最新添加的内容 @high (2026-05-17)
-- [ ] fgb重启后，以及已有话题重新唤醒后，acp回复仍旧会携带session历史 @high
+- [x] 为 fgb 重启和 acp 进程唤醒后的响应裁剪流程增加深度 Debug 日志 @high (2026-05-19)
+- [x] 修复 fgb 重启后历史基准丢失及裁剪算法失效的问题 @high (2026-05-19)
+- [ ] 验证重启后的第一条消息是否已成功裁剪历史上下文 @high
+
+
+- [ ] systemInstruction效果被gemini.md覆盖 @high

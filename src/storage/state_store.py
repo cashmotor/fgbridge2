@@ -57,42 +57,41 @@ class StateStore:
     # --- Topics 管理 ---
     async def get_topic(self, topic_id: str):
         async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
             async with db.execute("SELECT * FROM topics WHERE topic_id = ?", (topic_id,)) as cursor:
                 row = await cursor.fetchone()
                 if row:
-                    content = row[4]
+                    content = row["last_full_content"]
                     # 防御性逻辑：如果数据库里是空数字或空值，强制转为 None
                     if not content or content == 0 or content == "0":
                         content = None
                         
                     return {
-                        "topic_id": row[0],
-                        "scope_id": row[1],
-                        "role": row[2],
-                        "session_id": row[3],
+                        "topic_id": row["topic_id"],
+                        "scope_id": row["scope_id"],
+                        "role": row["role"],
+                        "session_id": row["session_id"],
                         "last_full_content": content,
-                        "last_active_time": row[5]
+                        "last_active_time": row["last_active_time"]
                     }
                 return None
 
     async def save_topic(self, topic_id: str, scope_id: str, role: str = None, session_id: str = None, last_full_content: str = None):
+        if last_full_content:
+            logger.debug(f"正在保存话题 {topic_id} 的全量内容，长度: {len(last_full_content)}")
+            
         async with aiosqlite.connect(self.db_path) as db:
-            if last_full_content is not None:
-                await db.execute("""
-                    INSERT OR REPLACE INTO topics (topic_id, scope_id, role, session_id, last_full_content, last_active_time)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (topic_id, scope_id, role, session_id, last_full_content, int(time.time())))
-            else:
-                # 兼容不更新内容的情况
-                await db.execute("""
-                    INSERT INTO topics (topic_id, scope_id, role, session_id, last_active_time)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(topic_id) DO UPDATE SET
-                        scope_id=excluded.scope_id,
-                        role=COALESCE(excluded.role, topics.role),
-                        session_id=COALESCE(excluded.session_id, topics.session_id),
-                        last_active_time=excluded.last_active_time
-                """, (topic_id, scope_id, role, session_id, int(time.time())))
+            # 使用 ON CONFLICT 增量更新，确保原有字段不被 NULL 覆盖
+            await db.execute("""
+                INSERT INTO topics (topic_id, scope_id, role, session_id, last_full_content, last_active_time)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(topic_id) DO UPDATE SET
+                    scope_id=excluded.scope_id,
+                    role=COALESCE(excluded.role, topics.role),
+                    session_id=COALESCE(excluded.session_id, topics.session_id),
+                    last_full_content=COALESCE(excluded.last_full_content, topics.last_full_content),
+                    last_active_time=excluded.last_active_time
+            """, (topic_id, scope_id, role, session_id, last_full_content, int(time.time())))
             await db.commit()
 
     # --- Pending Confirms 管理 ---

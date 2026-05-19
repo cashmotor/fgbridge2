@@ -135,32 +135,39 @@ class Router:
 
         if topic and topic.get("session_id"):
             session_id = topic["session_id"]
-            logger.info(f"检测到历史会话，尝试寻回内存/磁盘记忆: {session_id} (Role: {role})")
+            logger.info(f"检测到历史会话: {session_id} (Role: {role})")
+            
+            # Debug: 数据库读取详情
+            raw_base = topic.get("last_full_content")
+            logger.debug(f"数据库中读取到的基准长度: {len(str(raw_base)) if raw_base else 'None'}")
+
             if not acp.session_load(session_id):
                 logger.warning(f"记忆寻回失败 (可能已被 CLI 清理)，将作为新会话处理")
                 session_id = acp.session_new()
             else:
-                # 核心修复：还原响应裁剪的基准内容
-                last_content = topic.get("last_full_content")
-                if last_content:
-                    # 确保是字符串类型以规避 len() 报错
-                    last_content_str = str(last_content)
-                    acp._session_full_contents[session_id] = last_content_str
-                    logger.debug(f"已还原 Session {session_id} 的裁剪基准 (长度: {len(last_content_str)})")
+                # 还原响应裁剪的基准内容
+                if raw_base:
+                    acp._session_full_contents[session_id] = str(raw_base)
+                    preview = acp._session_full_contents[session_id][:50].replace("\n", " ")
+                    logger.success(f"已还原 Session {session_id} 的裁剪基准 (长度: {len(acp._session_full_contents[session_id])}, 预览: {preview}...)")
+                else:
+                    logger.warning(f"Session {session_id} 无历史基准记录")
         else:
+            logger.info(f"新话题 {topic_id}，创建新会话")
             session_id = acp.session_new()
-
-        # 记录请求前的状态
-        await self.store.save_topic(topic_id, chat_id, role=role, session_id=session_id)
-
+        
+        # 记录请求前的状态 (确保不传递空 content 导致 COALESCE 失效)
+        await self.store.save_topic(topic_id, chat_id, role=role, session_id=session_id, last_full_content=None)
+        
         # 发送请求
         resp = acp.send(session_id, text, attachments)
         acp.session_save(session_id)
-
-        # 核心增强：持久化最新的全量内容，供下次 FGB 重启后寻回
-        new_full_content = acp._session_full_contents.get(session_id, "")
+        
+        # 核心增强：持久化最新的全量内容
+        new_full_content = resp.get("result", {}).get("full_content_for_persistence")
         if new_full_content:
             await self.store.save_topic(topic_id, chat_id, last_full_content=new_full_content)
+            logger.debug(f"已持久化话题 {topic_id} 的全量基准 (长度: {len(new_full_content)})")
 
         # 5. 发送正式回答
         await self._handle_acp_response(resp, chat_id, origin_msg_id, session_id, topic_id)
@@ -170,13 +177,10 @@ class Router:
 
     async def _finalize_reaction(self, message_id: str):
         """流转表情状态：即时寻址删除 GET，添加 DONE"""
-        # 1. 尝试删除 GET (OK)
-        if config.reaction_get:
-            await self.feishu.delete_bot_reaction_by_type(message_id, config.reaction_get)
-            
-        # 2. 添加 DONE
         if config.reaction_done:
             await self.feishu.add_reaction(message_id, config.reaction_done)
+        if config.reaction_get:
+            await self.feishu.delete_bot_reaction_by_type(message_id, config.reaction_get)
 
     async def _handle_acp_response(self, resp: dict, chat_id: str, message_id: str, session_id: str, topic_id: str) -> Optional[str]:
         result = resp.get("result", {})

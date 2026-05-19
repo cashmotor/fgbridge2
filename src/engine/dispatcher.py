@@ -60,7 +60,7 @@ class ACPDispatcher:
         now = time.time()
         to_remove = []
         for role, item in self.pool.items():
-            ttl = config.assistant_ttl if role == "Assistant" else config.expert_ttl
+            ttl = config.assistant_ttl if role == config.assistant_role else config.expert_ttl
             if now - item["last_active"] > ttl:
                 logger.info(f"角色 {role} 的进程已超过 TTL ({ttl}s)，正在执行惰性退出...")
                 item["provider"].stop()
