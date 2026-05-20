@@ -73,7 +73,6 @@ class ACPProvider:
 
             capabilities = {"promptCapabilities": {"image": True, "audio": True}, "mcpCapabilities": {"http": True}}
             params = {"protocolVersion": 1, "capabilities": capabilities}
-            if system_prompt: params["systemInstruction"] = system_prompt
 
             self._call("initialize", params, is_initializing=True)
             logger.success(f"ACP 进程初始化成功")

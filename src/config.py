@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     gemini_use_yolo: bool = False
     acp_silent_flush_enabled: bool = True
     acp_silent_flush_prompt: str = "Hi"
+    acp_card_mode_enabled: bool = False  # 默认使用表情授权，而非卡片回调
     
     # 存储配置
     db_path: str = "data/fgbridge.db"
@@ -35,6 +36,12 @@ class Settings(BaseSettings):
     long_response_threshold: int = 150  # 触发文档化的字数阈值
     reaction_get: str = "GET"
     reaction_done: str = "DONE"
+
+    # 授权表情包 (飞书表情 Type)
+    # 同意：OK, YES, CHECK_MARK
+    # 拒绝：NO, CROSS_MARK
+    reaction_yes: list = ["OK", "YES", "CHECKMARK", "THUMBSUP"]
+    reaction_no: list = ["NO", "CROSSMARK", "THUMBSDOWN"]
     
     # 网络配置
     http_proxy: Optional[str] = None

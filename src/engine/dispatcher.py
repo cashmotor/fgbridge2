@@ -27,6 +27,10 @@ class ACPDispatcher:
                 logger.error(f"加载角色提示词失败: {e}")
         return {}
 
+    def get_role_prompt(self, role: str) -> str:
+        """获取指定角色的提示词内容"""
+        return self._role_prompts.get(role, "You are a helpful assistant.")
+
     def get_acp(self, role: str) -> ACPProvider:
         """获取或唤醒指定角色的 ACP 进程"""
         now = time.time()
