@@ -63,7 +63,52 @@
 
 ---
 
-## 5. 安全性评估
-1.  **防误触**：通过不同消息层级的双重表情确认，物理隔离误操作。
-2.  **防绕过**：新消息进入自动清理挂起状态，确保授权的时效性。
-3.  **幂等性**：基于消息 ID 寻址，确保一个表情仅触发一次逻辑变更。
+## 6. 多模态附件流水线 (Multimodal Attachment Pipeline)
+
+### 6.1 飞书复杂消息解析
+**背景**：飞书 IM 消息除基础 `text` 类型外，还包含 `post`（富文本）和 `image` 等类型。
+**处理逻辑**：
+- **`post` 类型解析**：遍历 `content` 数组中的所有 block。
+    - 提取 `tag: "text"` 的内容拼接至主文本。
+    - 提取 `tag: "img"` 的 `image_key` 加入待处理附件列表。
+- **字段兼容性**：支持飞书事件流中 `message_type` 和 `msg_type` 字段的混用。
+
+### 6.2 资源下载与 API 区分
+为确保附件下载成功率，系统严格区分了资源类型及其对应的 API 接口：
+- **图片类 (`image_key`)**：采用**双策略降级下载机制**，优先利用消息上下文以获得更高成功率：
+    1. **主策略**：优先尝试通用的 `lark.im.v1.GetMessageResourceRequest` API，通过传入 `message_id` 实现权限穿透，特别适用于即时发送的图片。
+    2. **降级策略**：若消息资源接口不可用或失败，自动降级使用专用的 `lark.im.v1.GetImageRequest` API（用于下载应用内自有资源）。
+    3. **参数清洗**：所有传入的 `image_key` 在请求前均经过严格的字符清洗，杜绝 JSON 解析残留的隐藏引号导致请求失效。
+
+- **文件类 (`file_key`)**：使用通用的 `lark.im.v1.GetMessageResourceRequest` API，且必须显式指定 `type: "file"`。
+- **工作目录绑定**：附件下载路径始终相对于 `gemini_cwd` (ACP 进程工作目录)，确保 ACP 内部能通过 `file://` 正确引用。
+
+### 6.3 飞书文档自动处理
+针对文本中包含的飞书文档链接（Docx, Sheet, Wiki, Bitable）：
+- **自动识别**：基于正则识别飞书文档 Token 和对象类型。
+- **导出策略**：
+    - **二进制导出**：优先尝试将文档导出为用户配置的格式（如 PDF/Docx/Xlsx）。
+    - **Markdown 降级**：若未配置导出或导出失败，对 Docx 文档进行 block 级递归解析，转换为 Markdown 注入 Prompt。
+- **Wiki 节点穿透**：针对 Wiki 类型链接，自动解析出其背后关联的实际 `obj_token`，若 Wiki API 失败则调用 Drive API 兜底搜索。
+
+---
+
+## 7. 交互反馈优化 (UX Feedback)
+
+### 7.1 表情反馈逻辑
+为提升系统受理任务的实时感，增加了以下表情反馈机制（均遵循飞书标准大小写命名，例如 `Get`、`Done`、`Error`）：
+- **受理反馈 (Get)**：在 `_handle_message` 入口处立即回复 `Get` 表情，不等待耗时的导出/下载操作。
+- **完成反馈 (Done)**：任务成功回复后，将 `Get` 替换为 `Done`。
+- **无效/失效反馈 (Error/配置项)**：
+    - 针对因内容/附件均为空而被跳过的消息，回复配置的 `reaction_invalid`（如 `Error` 或 `CrossMark`）。
+    - 针对因新消息输入而自动失效的授权请求，在原消息上追加失效表情，提供视觉反馈且不覆盖原有的 `Get`。
+
+---
+
+## 8. 模块变更清单 (续)
+
+| 模块 | 变更点 | 优先级 |
+| :--- | :--- | :--- |
+| `src/provider/feishu_im.py` | 新增 `FeishuUrlResolver`, `download_image`, `aexport_document` | @high |
+| `src/engine/router.py` | 重构 `_handle_message` 解析 `post` 类型；重构附件下载路径逻辑 | @high |
+| `src/config.py` | 增加 `feishu_export_type` 导出格式配置 | @med |

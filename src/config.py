@@ -34,14 +34,18 @@ class Settings(BaseSettings):
     assistant_ttl: int = 3600  # 助理常驻时间 (秒)
     expert_ttl: int = 600      # 专家进程 TTL (秒)
     long_response_threshold: int = 150  # 触发文档化的字数阈值
-    reaction_get: str = "GET"
-    reaction_done: str = "DONE"
+    reaction_get: str = "Get"
+    reaction_done: str = "Done"
+    reaction_invalid: str = "CrossMark"
+    feishu_export_type: str = "pdf" # 飞书文档导出格式，留空则尝试提取文本
 
-    # 授权表情包 (飞书表情 Type)
+    # 授权表情包 (飞书表情 Type - 注意区分大小写)
+    # https://open.feishu.cn/document/server-docs/im-v1/message-reaction/emojis-introduce
     # 同意：OK, YES, CHECK_MARK
     # 拒绝：NO, CROSS_MARK
-    reaction_yes: list = ["OK", "YES", "CHECKMARK", "THUMBSUP"]
-    reaction_no: list = ["NO", "CROSSMARK", "THUMBSDOWN"]
+    reaction_yes: list = ["OK", "Yes", "CheckMark", "THUMBSUP"]
+    reaction_no: list = ["No", "CrossMark", "ThumbsDown"]
+
     
     # 网络配置
     http_proxy: Optional[str] = None

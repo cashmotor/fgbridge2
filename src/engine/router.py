@@ -2,6 +2,7 @@ import json
 import base64
 import mimetypes
 import os
+import re
 from typing import Optional, List, Dict, Any
 from loguru import logger
 from src.storage.state_store import StateStore
@@ -36,15 +37,63 @@ class Router:
         chat_id = message.get("chat_id")
         chat_type = message.get("chat_type")
         message_id = message.get("message_id")
+        # 兼容 message_type 或 msg_type
+        msg_type = message.get("message_type") or message.get("msg_type")
         
+        logger.debug(f"[_handle_message] 开始处理消息: ID={message_id}, 类型={msg_type}")
+        logger.debug(f"[_handle_message] 原始消息数据: {json.dumps(message, ensure_ascii=False)}")
+
+        # 0. 立即回复 GET 表情，告知用户已收到消息
+        if config.reaction_get:
+            await self.feishu.add_reaction(message_id, config.reaction_get)
+
         thread_id = message.get("thread_id") or ""
         root_id = message.get("root_id") or ""
         
-        attachments = await self._process_attachments(message)
-        content_json = json.loads(message.get("content", "{}"))
-        text = content_json.get("text", "").strip()
+        content_str = message.get("content", "{}")
+        try:
+            content_json = json.loads(content_str)
+        except Exception as e:
+            logger.error(f"[_handle_message] 解析消息内容 JSON 失败: {e}, 内容: {content_str}")
+            content_json = {}
+
+        text = ""
+        extracted_image_keys = []
+        if msg_type == "text":
+            text = content_json.get("text", "")
+        elif msg_type == "post":
+            # 解析富文本消息
+            for block_list in content_json.get("content", []):
+                for element in block_list:
+                    if element.get("tag") == "text":
+                        text += element.get("text", "")
+                    elif element.get("tag") == "img":
+                        extracted_image_keys.append(element.get("image_key"))
+        elif msg_type == "image":
+            if "image_key" in content_json:
+                extracted_image_keys.append(content_json["image_key"])
+
+        text = text.strip()
+        
+        # 将解析到的 image_keys 存入 message 供 _process_attachments 使用
+        if extracted_image_keys:
+            existing_keys = message.get("image_keys") or []
+            message["image_keys"] = list(set(existing_keys + extracted_image_keys))
+        
+        logger.debug(f"[_handle_message] 准备提取附件: text_len={len(text)}")
+        extra_text, attachments = await self._process_attachments(message, text)
+        
+        if extra_text:
+            logger.debug(f"[_handle_message] 提取到额外文本: {len(extra_text)} chars")
+            text += extra_text
+
+        logger.debug(f"[_handle_message] 最终处理内容: text_len={len(text)}, attachments_count={len(attachments)}")
 
         if not text and not attachments:
+            logger.warning(f"[_handle_message] 消息内容和附件均为空，跳过处理 (ID={message_id})")
+            # 标记为跳过/无效
+            if config.reaction_invalid:
+                await self.feishu.add_reaction(message_id, config.reaction_invalid)
             return
 
         topic_id = ""
@@ -71,9 +120,6 @@ class Router:
 
         # 1. 核心增强：检测到新消息，自动失效挂起的授权
         await self._auto_expire_pending_confirms(topic_id)
-
-        if config.reaction_get:
-            await self.feishu.add_reaction(message_id, config.reaction_get)
 
         topic = await self.store.get_topic(topic_id)
         
@@ -165,26 +211,104 @@ class Router:
             logger.info(f"检测到新消息，自动失效旧授权: {p['confirm_id']}")
             if p.get("msg_id"):
                 await self.feishu.reply(p["msg_id"], "⌛ 此授权请求已因新消息输入而自动失效。")
+                # 增加失效表情反馈
+                if config.reaction_invalid:
+                    await self.feishu.add_reaction(p["msg_id"], config.reaction_invalid)
             await self.store.remove_pending_confirm(p["confirm_id"])
 
-    async def _process_attachments(self, message: dict) -> list:
+    async def _process_attachments(self, message: dict, text: str) -> tuple[str, list]:
+        extra_text = ""
         attachments = []
         message_id = message.get("message_id")
-        image_keys = message.get("image_keys", [])
-        file_keys = message.get("file_keys", [])
+        # 兼容 message_type 或 msg_type
+        msg_type = message.get("message_type") or message.get("msg_type")
         
-        for key in image_keys:
-            save_path = f"{config.attachment_dir}/{message_id}_{key[:8]}.png"
-            if await self.feishu.download_resource(message_id, key, save_path):
+        # 飞书不同事件中 Key 的位置可能不同，这里做多重兼容
+        image_keys = message.get("image_keys") or []
+        file_keys = message.get("file_keys") or []
+
+        logger.debug(f"[_process_attachments] 发现待处理 Key: images={image_keys}, files={file_keys}")
+        
+        # 确保附件目录在 acp 进程工作目录下 (V1.8 路径修复)
+        base_dir = config.gemini_cwd if config.gemini_cwd else os.getcwd()
+        abs_attachment_dir = os.path.join(base_dir, config.attachment_dir)
+        os.makedirs(abs_attachment_dir, exist_ok=True)
+
+        # 1. 处理直接发送的图片
+        for i, key in enumerate(image_keys):
+            # 严格清洗 Key
+            clean_key = key.strip().replace("\"", "").replace("'", "")
+            # 文件名使用截断以保持简洁，但传给 API 必须用 clean_key
+            save_path = os.path.join(abs_attachment_dir, f"{message_id}_{i}_{clean_key[:10]}.png")
+            
+            logger.debug(f"[_process_attachments] 正在下载图片: {clean_key} -> {save_path}")
+            if await self.feishu.download_image(clean_key, save_path, message_id=message_id):
                 with open(save_path, "rb") as f:
                     data_base64 = base64.b64encode(f.read()).decode("utf-8")
                 attachments.append({"type": "image", "data": data_base64, "mimeType": "image/png"})
+                logger.success(f"[_process_attachments] 图片下载并编码成功: {clean_key}")
+            else:
+                logger.error(f"[_process_attachments] 图片下载失败: {clean_key}")
 
+        # 2. 处理直接发送的文件
         for key in file_keys:
-            save_path = f"{config.attachment_dir}/{message_id}_{key[:8]}"
-            if await self.feishu.download_resource(message_id, key, save_path):
-                attachments.append({"type": "resource_link", "uri": f"file://{os.path.abspath(save_path)}"})
-        return attachments
+            save_path = os.path.join(abs_attachment_dir, f"{message_id}_{key[:8]}")
+            logger.debug(f"[_process_attachments] 正在下载文件: {key} -> {save_path}")
+            if await self.feishu.download_resource(message_id, key, save_path, resource_type="file"):
+                attachments.append({"type": "resource_link", "name": key[:8], "uri": f"file://{os.path.abspath(save_path)}"})
+                logger.success(f"[_process_attachments] 文件下载成功: {key}")
+            else:
+                logger.error(f"[_process_attachments] 文件下载失败: {key}")
+
+        # 3. 解析文本中的飞书链接 (V1.8)
+        urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', text)
+        for url in urls:
+            if "feishu.cn" not in url:
+                continue
+            
+            doc_info = self.feishu.resolver.parse(url)
+            if doc_info:
+                token = doc_info["token"]
+                obj_type = doc_info["type"]
+                logger.info(f"检测到飞书文档链接: {token} (type: {obj_type})")
+                
+                export_ext = (config.feishu_export_type or "").strip().lower()
+                content = None
+                
+                # 尝试导出
+                if export_ext:
+                    logger.info(f"正在尝试导出文档为 {export_ext}...")
+                    content = await self.feishu.aexport_document(token, obj_type, export_ext)
+                    if content:
+                        filename = f"exported_{token[:8]}.{export_ext}"
+                        save_path = os.path.join(abs_attachment_dir, f"{message_id}_{filename}")
+                        
+                        with open(save_path, "wb") as f:
+                            f.write(content)
+                        
+                        attachments.append({
+                            "type": "resource_link",
+                            "name": filename,
+                            "uri": f"file://{os.path.abspath(save_path)}"
+                        })
+                        logger.success(f"飞书文档导出成功: {filename}")
+                
+                # 如果未指定导出格式或导出失败，尝试提取 Markdown (仅限 docx)
+                if not content:
+                    actual_token, actual_type = token, obj_type
+                    if obj_type == "wiki":
+                        try:
+                            actual_token, actual_type = await self.feishu.resolver.a_resolve_wiki_node(token)
+                        except:
+                            actual_type = "unknown"
+
+                    if actual_type == "docx":
+                        logger.info("提取 Docx Markdown 文本...")
+                        doc_md = await self.feishu.aget_docx_markdown(actual_token)
+                        if doc_md:
+                            extra_text += f"\n\n--- 附件文档内容 [{actual_token}] ---\n{doc_md}\n"
+        
+        return extra_text, attachments
 
     async def _bind_topic_and_route(self, chat_id: str, topic_id: str, message_id: str, text: str, attachments: list):
         role = "Developer" 
