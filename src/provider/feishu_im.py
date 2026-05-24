@@ -3,7 +3,8 @@ import json
 import httpx
 import re
 import asyncio
-from typing import Optional, List, Any, Dict
+import random
+from typing import Optional, List, Any, Dict, Union
 from urllib.parse import urlparse
 from loguru import logger
 import lark_oapi as lark
@@ -198,16 +199,21 @@ class FeishuIMProvider:
             logger.exception(f"[download_image] 发生异常: {e}, key: {clean_key}")
             return False
 
-    async def add_reaction(self, message_id: str, emoji_type: str) -> Optional[str]:
-        """为消息添加表情回复 (增强型：支持重试与详细日志)"""
-        logger.debug(f"[FeishuIM] 准备添加表情 {emoji_type} -> 消息 {message_id}")
+    async def add_reaction(self, message_id: str, emoji_type: Union[str, list]) -> Optional[str]:
+        """为消息添加表情回复 (支持随机选择)"""
+        # 如果是列表，随机选一个
+        selected_emoji = emoji_type
+        if isinstance(emoji_type, list) and emoji_type:
+            selected_emoji = random.choice(emoji_type)
+        
+        logger.debug(f"[FeishuIM] 准备添加表情 {selected_emoji} -> 消息 {message_id}")
         
         request = (
             lark.im.v1.CreateMessageReactionRequest.builder()
             .message_id(message_id)
             .request_body(
                 lark.im.v1.CreateMessageReactionRequestBody.builder()
-                .reaction_type(lark.im.v1.Emoji.builder().emoji_type(emoji_type).build())
+                .reaction_type(lark.im.v1.Emoji.builder().emoji_type(selected_emoji).build())
                 .build()
             )
             .build()
@@ -222,12 +228,12 @@ class FeishuIMProvider:
                 )
                 
                 if response.success():
-                    logger.debug(f"[FeishuIM] 表情 {emoji_type} 添加成功 (尝试次数: {attempt+1})")
+                    logger.debug(f"[FeishuIM] 表情 {selected_emoji} 添加成功 (尝试次数: {attempt+1})")
                     return response.data.reaction_id
                 
                 # 记录详细的飞书错误信息
                 log_id = response.get_log_id()
-                logger.error(f"[FeishuIM] 添加表情失败: {response.msg} (code: {response.code}, log_id: {log_id}, emoji: {emoji_type})")
+                logger.error(f"[FeishuIM] 添加表情失败: {response.msg} (code: {response.code}, log_id: {log_id}, emoji: {selected_emoji})")
                 
                 # 如果是频率限制等可重试错误，可以在此根据 code 判断是否继续循环
                 if response.code != 99991663: # 99991663 通常是无权限，重试也没用
@@ -236,16 +242,19 @@ class FeishuIMProvider:
                 break
                 
             except asyncio.TimeoutError:
-                logger.warning(f"[FeishuIM] 添加表情请求超时 (10s), 正在尝试重试... ({attempt+1}/2)")
+                logger.warning(f"[FeishuIM] 添加表情请求超时 (5s), 正在尝试重试... ({attempt+1}/2)")
             except Exception as e:
                 logger.error(f"[FeishuIM] 添加表情发生异常: {e}")
                 break
                 
         return None
 
-    async def delete_bot_reaction_by_type(self, message_id: str, emoji_type: str) -> bool:
-        """通过即时查询并匹配，删除机器人自己添加的特定类型表情"""
+    async def delete_bot_reaction_by_type(self, message_id: str, emoji_type: Union[str, list]) -> bool:
+        """通过即时查询并匹配，删除机器人自己添加的特定类型或列表中的所有表情"""
         try:
+            # 统一转为大写列表处理
+            target_emojis = [emoji_type.upper()] if isinstance(emoji_type, str) else [e.upper() for e in emoji_type]
+            
             # 1. 查询该消息下的所有表情
             list_req = (
                 lark.im.v1.ListMessageReactionRequest.builder()
@@ -259,9 +268,11 @@ class FeishuIMProvider:
             
             # 2. 遍历并匹配 (找到自己发的且类型一致的)
             items = list_resp.data.items or []
+            deleted_any = False
             for item in items:
-                # 检查表情类型是否匹配
-                if item.reaction_type.emoji_type.upper() == emoji_type.upper():
+                current_emoji = item.reaction_type.emoji_type.upper()
+                # 检查表情类型是否在目标列表中
+                if current_emoji in target_emojis:
                     # 关键：检查操作者是否为当前 App (即机器人自己)
                     if item.operator.operator_type == "app":
                         # 3. 执行精准删除
@@ -272,9 +283,9 @@ class FeishuIMProvider:
                             .build()
                         )
                         await self.client.im.v1.message_reaction.adelete(del_req)
-                        logger.debug(f"成功清理机器人表情: {emoji_type} (ID: {item.reaction_id[:10]}...)")
-                        return True
-            return False
+                        logger.debug(f"成功清理机器人表情: {current_emoji} (ID: {item.reaction_id[:10]}...)")
+                        deleted_any = True
+            return deleted_any
         except Exception as e:
             logger.error(f"清理机器人表情异常: {e}")
             return False

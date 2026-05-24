@@ -1,5 +1,6 @@
-from typing import Optional
+from typing import Optional, Union, Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import field_validator
 from pathlib import Path
 
 class Settings(BaseSettings):
@@ -34,10 +35,22 @@ class Settings(BaseSettings):
     assistant_ttl: int = 3600  # 助理常驻时间 (秒)
     expert_ttl: int = 600      # 专家进程 TTL (秒)
     long_response_threshold: int = 150  # 触发文档化的字数阈值
-    reaction_get: str = "Get"
-    reaction_done: str = "Done"
-    reaction_invalid: str = "CrossMark"
+    
+    # 这里使用 Any 以避免 pydantic-settings 强制执行 JSON 解析失败
+    reaction_get: Any = ["Get"]
+    reaction_done: Any = ["Done"]
+    reaction_invalid: Any = ["CrossMark"]
     feishu_export_type: str = "pdf" # 飞书文档导出格式，留空则尝试提取文本
+
+    @field_validator("reaction_get", "reaction_done", "reaction_invalid", mode="before")
+    @classmethod
+    def validate_reaction_list(cls, v: Any) -> list:
+        if isinstance(v, str):
+            # 处理逗号分隔字符串或单字符串
+            return [i.strip() for i in v.split(",") if i.strip()]
+        if isinstance(v, list):
+            return v
+        return [str(v)]
 
     # 授权表情包 (飞书表情 Type - 注意区分大小写)
     # https://open.feishu.cn/document/server-docs/im-v1/message-reaction/emojis-introduce

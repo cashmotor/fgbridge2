@@ -86,3 +86,15 @@
 ### State
 - **输入体验**: 用户现在可以连续发送多条短消息（或图文混排），系统会将其视为一个完整的 Prompt 处理，大幅减少了碎片化的回复和 ACP 消耗。
 - **视觉反馈**: 回复表情仅出现在最后一条消息上，保持了 IM 会话的整洁。
+
+## [2026-05-24] UX 优化：表情回复多样化
+
+### Done
+- **多表情随机采用**:
+    - 在 `config.py` 中将 `reaction_get`, `reaction_done`, `reaction_invalid` 升级为列表类型。
+    - 实现了 `validate_reaction_list` 校验器，兼容旧版单字符串及逗号分隔字符串配置。
+    - 修改 `FeishuIMProvider.add_reaction`，使用 `random.choice` 从配置列表中随机挑选表情。
+    - 增强了 `delete_bot_reaction_by_type`，支持传入列表并清理掉列表中所有匹配的机器人表情。
+
+### State
+- **交互趣味性**: 机器人现在会随机选用不同的表情（如 `Eyes`, `SMILE`, `RAINBOW` 等）来反馈受理和完成状态，提升了产品的亲和力。
