@@ -12,13 +12,15 @@
 - [x] 实现 3 秒快速 ACK 响应逻辑 @high (2026-05-16)
 - [x] 整理所需调用的 lark API 清单，更新 docs/lark_api_list.md @high (2026-05-16)
 - [x] 捕获 im.message.reaction.created_v1 事件以支持表情授权 @high (2026-05-19)
-- [ ] 支持多条连续输入的用户消息打包处理 @high
+- [x] 支持多条连续输入的用户消息打包处理 @high (2026-05-24)
 
 ## [状态持久化]
 - [x] 建立 SQLite 数据库模型 (src/storage/state_store.py) @high (2026-05-16)
 - [x] 实现 Topics (Scope-Topic 映射) 存储逻辑 @high (2026-05-16)
 - [x] 实现 Sessions 状态管理逻辑 @med (2026-05-16)
 - [x] 数据库表结构升级，支持多步授权状态追踪 (confirm_step, msg_id) @high (2026-05-19)
+- [ ] 通过飞书机器人菜单切换常驻助理 Session 的能力 @high
+- [ ] 通过飞书机器人菜单重启后段 Python 服务的能力 @med
 
 ## [外部集成]
 - [x] 移植并适配 ACP 协议组件 (src/provider/acp.py) @high (2026-05-16)

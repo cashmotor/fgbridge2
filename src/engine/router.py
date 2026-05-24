@@ -3,6 +3,7 @@ import base64
 import mimetypes
 import os
 import re
+import asyncio
 from typing import Optional, List, Dict, Any
 from loguru import logger
 from src.storage.state_store import StateStore
@@ -41,15 +42,16 @@ class Router:
         msg_type = message.get("message_type") or message.get("msg_type")
         
         logger.debug(f"[_handle_message] 开始处理消息: ID={message_id}, 类型={msg_type}")
-        logger.debug(f"[_handle_message] 原始消息数据: {json.dumps(message, ensure_ascii=False)}")
-
-        # 0. 立即回复 GET 表情，告知用户已收到消息
+        
+        # 0. 立即回复 GET 表情，告知用户已收到消息 (非阻塞)
         if config.reaction_get:
-            await self.feishu.add_reaction(message_id, config.reaction_get)
+            logger.debug(f"[_handle_message] 异步提交 GET 表情: {message_id}")
+            asyncio.create_task(self.feishu.add_reaction(message_id, config.reaction_get))
 
         thread_id = message.get("thread_id") or ""
         root_id = message.get("root_id") or ""
         
+        logger.debug(f"[_handle_message] 提取内容字段...")
         content_str = message.get("content", "{}")
         try:
             content_json = json.loads(content_str)
@@ -118,17 +120,23 @@ class Router:
                 topic_id = chat_id
                 target_role = config.assistant_role
 
+        logger.debug(f"[_handle_message] 路由决策: topic_id={topic_id}, role={target_role}, is_subtask={is_subtask}")
+
         # 1. 核心增强：检测到新消息，自动失效挂起的授权
         await self._auto_expire_pending_confirms(topic_id)
 
         topic = await self.store.get_topic(topic_id)
+        logger.debug(f"[_handle_message] 获取 Topic 状态: {'found' if topic else 'not found'}")
         
         if is_subtask:
             if not topic:
+                logger.debug(f"[_handle_message] 分发至 _bind_topic_and_route")
                 await self._bind_topic_and_route(chat_id, topic_id, message_id, text, attachments)
             else:
+                logger.debug(f"[_handle_message] 分发至 _route_to_role (subtask)")
                 await self._route_to_role(topic["role"], chat_id, message_id, text, attachments, topic, topic_id, message_id)
         else:
+            logger.debug(f"[_handle_message] 分发至 _route_to_role (main)")
             await self._route_to_role(target_role, chat_id, message_id, text, attachments, topic, topic_id, message_id)
 
     async def _handle_reaction(self, event_data: dict):
@@ -183,7 +191,7 @@ class Router:
                 await self._execute_confirm_decision(pending, "deny", message_id)
 
     async def _execute_confirm_decision(self, pending: dict, decision: str, current_msg_id: str):
-        """执行最终授权决策并反馈"""
+        """执行最终授权决策并反馈 (异步化)"""
         confirm_id = pending["confirm_id"]
         topic_id = pending["topic_id"]
         session_id = pending["session_id"]
@@ -191,11 +199,13 @@ class Router:
         topic = await self.store.get_topic(topic_id)
         role = topic["role"] if topic else config.assistant_role
         
-        acp = self.dispatcher.get_acp(role)
+        # 异步获取 ACP
+        acp = await asyncio.to_thread(self.dispatcher.get_acp, role)
         logger.info(f"正在执行授权决策: {confirm_id} -> {decision}")
         
-        resp = acp.confirm(session_id, confirm_id, decision)
-        acp.session_save(session_id)
+        # 异步执行确认并保存
+        resp = await asyncio.to_thread(acp.confirm, session_id, confirm_id, decision)
+        await asyncio.to_thread(acp.session_save, session_id)
         
         await self.store.remove_pending_confirm(confirm_id)
         
@@ -220,47 +230,60 @@ class Router:
         extra_text = ""
         attachments = []
         message_id = message.get("message_id")
-        # 兼容 message_type 或 msg_type
-        msg_type = message.get("message_type") or message.get("msg_type")
         
-        # 飞书不同事件中 Key 的位置可能不同，这里做多重兼容
-        image_keys = message.get("image_keys") or []
-        file_keys = message.get("file_keys") or []
+        # 1. 优先获取打包后的带上下文附件
+        bundled_images = message.get("bundled_images") or []
+        bundled_files = message.get("bundled_files") or []
+        
+        # 2. 如果没有打包数据，则尝试从普通消息结构中提取 (兼容非打包模式)
+        if not bundled_images:
+            image_keys = message.get("image_keys") or []
+            for key in image_keys:
+                bundled_images.append({"key": key, "msg_id": message_id})
+        
+        if not bundled_files:
+            file_keys = message.get("file_keys") or []
+            for key in file_keys:
+                bundled_files.append({"key": key, "msg_id": message_id})
 
-        logger.debug(f"[_process_attachments] 发现待处理 Key: images={image_keys}, files={file_keys}")
+        logger.debug(f"[_process_attachments] 准备处理附件: images={len(bundled_images)}, files={len(bundled_files)}")
         
-        # 确保附件目录在 acp 进程工作目录下 (V1.8 路径修复)
+        # 确保附件目录在 acp 进程工作目录下
         base_dir = config.gemini_cwd if config.gemini_cwd else os.getcwd()
         abs_attachment_dir = os.path.join(base_dir, config.attachment_dir)
         os.makedirs(abs_attachment_dir, exist_ok=True)
 
-        # 1. 处理直接发送的图片
-        for i, key in enumerate(image_keys):
-            # 严格清洗 Key
+        # 3. 处理图片
+        for i, item in enumerate(bundled_images):
+            key = item["key"]
+            origin_msg_id = item["msg_id"]
             clean_key = key.strip().replace("\"", "").replace("'", "")
-            # 文件名使用截断以保持简洁，但传给 API 必须用 clean_key
-            save_path = os.path.join(abs_attachment_dir, f"{message_id}_{i}_{clean_key[:10]}.png")
+            # 文件名加入 origin_msg_id 以防冲突
+            save_path = os.path.join(abs_attachment_dir, f"{origin_msg_id}_{i}_{clean_key[:8]}.png")
             
-            logger.debug(f"[_process_attachments] 正在下载图片: {clean_key} -> {save_path}")
-            if await self.feishu.download_image(clean_key, save_path, message_id=message_id):
+            logger.debug(f"[_process_attachments] 正在下载图片: {clean_key} (来自消息 {origin_msg_id})")
+            if await self.feishu.download_image(clean_key, save_path, message_id=origin_msg_id):
                 with open(save_path, "rb") as f:
                     data_base64 = base64.b64encode(f.read()).decode("utf-8")
                 attachments.append({"type": "image", "data": data_base64, "mimeType": "image/png"})
-                logger.success(f"[_process_attachments] 图片下载并编码成功: {clean_key}")
+                logger.success(f"[_process_attachments] 图片下载成功: {clean_key}")
             else:
                 logger.error(f"[_process_attachments] 图片下载失败: {clean_key}")
 
-        # 2. 处理直接发送的文件
-        for key in file_keys:
-            save_path = os.path.join(abs_attachment_dir, f"{message_id}_{key[:8]}")
-            logger.debug(f"[_process_attachments] 正在下载文件: {key} -> {save_path}")
-            if await self.feishu.download_resource(message_id, key, save_path, resource_type="file"):
+        # 4. 处理文件
+        for item in bundled_files:
+            key = item["key"]
+            origin_msg_id = item["msg_id"]
+            save_path = os.path.join(abs_attachment_dir, f"{origin_msg_id}_{key[:8]}")
+            
+            logger.debug(f"[_process_attachments] 正在下载文件: {key} (来自消息 {origin_msg_id})")
+            if await self.feishu.download_resource(origin_msg_id, key, save_path, resource_type="file"):
                 attachments.append({"type": "resource_link", "name": key[:8], "uri": f"file://{os.path.abspath(save_path)}"})
                 logger.success(f"[_process_attachments] 文件下载成功: {key}")
             else:
                 logger.error(f"[_process_attachments] 文件下载失败: {key}")
 
-        # 3. 解析文本中的飞书链接 (V1.8)
+        # 5. 解析文本中的飞书链接
         urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', text)
         for url in urls:
             if "feishu.cn" not in url:
@@ -312,14 +335,18 @@ class Router:
 
     async def _bind_topic_and_route(self, chat_id: str, topic_id: str, message_id: str, text: str, attachments: list):
         role = "Developer" 
-        acp = self.dispatcher.get_acp(role)
-        session_id = acp.session_new()
+        # 异步唤醒
+        acp = await asyncio.to_thread(self.dispatcher.get_acp, role)
+        session_id = await asyncio.to_thread(acp.session_new)
+        
         await self.store.save_topic(topic_id, chat_id, role=role, session_id=session_id)
         topic = await self.store.get_topic(topic_id)
         await self._route_to_role(role, chat_id, message_id, text, attachments, topic, topic_id, message_id)
 
     async def _route_to_role(self, role: str, chat_id: str, message_id: str, text: str, attachments: list, topic: dict, topic_id: str, origin_msg_id: str):
-        acp = self.dispatcher.get_acp(role)
+        # 异步获取或唤醒 ACP
+        acp = await asyncio.to_thread(self.dispatcher.get_acp, role)
+        
         session_id = None
         turn_count = (topic.get("turn_count") or 0) if topic else 0
         is_cold_start = False
@@ -327,13 +354,14 @@ class Router:
         if topic and topic.get("session_id"):
             session_id = topic["session_id"]
             if acp._active_session_id != session_id:
-                if not acp.session_load(session_id):
-                    session_id = acp.session_new()
+                # 异步加载 Session
+                if not await asyncio.to_thread(acp.session_load, session_id):
+                    session_id = await asyncio.to_thread(acp.session_new)
                     turn_count = 0
                 else:
                     is_cold_start = True
         else:
-            session_id = acp.session_new()
+            session_id = await asyncio.to_thread(acp.session_new)
             turn_count = 0
         
         turn_count += 1
@@ -343,12 +371,18 @@ class Router:
         if needs_role_init and config.acp_silent_flush_enabled:
             role_prompt = self.dispatcher.get_role_prompt(role)
             try:
-                acp.send(session_id, role_prompt)
+                # 异步注入角色
+                await asyncio.to_thread(acp.send, session_id, role_prompt)
             except Exception as e:
                 logger.error(f"角色注入执行异常: {e}")
 
-        resp = acp.send(session_id, text, attachments)
-        acp.session_save(session_id)
+        # 异步发送 Prompt 核心调用
+        logger.debug(f"[_route_to_role] 正在发送 Prompt 至 ACP...")
+        resp = await asyncio.to_thread(acp.send, session_id, text, attachments)
+        
+        # 异步保存状态
+        await asyncio.to_thread(acp.session_save, session_id)
+        
         await self._handle_acp_response(resp, chat_id, origin_msg_id, session_id, topic_id)
         await self._finalize_reaction(origin_msg_id)
 

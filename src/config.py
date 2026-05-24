@@ -46,7 +46,11 @@ class Settings(BaseSettings):
     reaction_yes: list = ["OK", "Yes", "CheckMark", "THUMBSUP"]
     reaction_no: list = ["No", "CrossMark", "ThumbsDown"]
 
-    
+    # 消息打包配置
+    bundling_enabled: bool = True
+    bundling_wait_time: float = 3.0  # 连续输入等待间隔 (秒)
+    bundling_max_messages: int = 20  # 单次打包最大消息数
+
     # 网络配置
     http_proxy: Optional[str] = None
     https_proxy: Optional[str] = None

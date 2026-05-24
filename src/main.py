@@ -8,6 +8,7 @@ from src.storage.state_store import StateStore
 from src.engine.dispatcher import ACPDispatcher
 from src.provider.feishu_im import FeishuIMProvider
 from src.engine.router import Router
+from src.engine.bundler import MessageBundler
 from src.listener.websocket import FeishuWebSocketListener
 from src.utils.card_builder import CardBuilder
 
@@ -38,7 +39,7 @@ def setup_logging():
         diagnose=True,
     )
 
-async def worker(queue: asyncio.Queue, router: Router):
+async def worker(queue: asyncio.Queue, bundler: MessageBundler):
     """异步任务消费者"""
     logger.info("事件处理 Worker 已启动")
     while True:
@@ -46,7 +47,7 @@ async def worker(queue: asyncio.Queue, router: Router):
         try:
             event_type = event.get('header', {}).get('event_type')
             logger.debug(f"正在处理事件: {event_type}")
-            await router.dispatch(event)
+            await bundler.add(event)
         except Exception as e:
             logger.error(f"处理事件时发生异常: {e}")
         finally:
@@ -69,12 +70,13 @@ async def main():
     dispatcher = ACPDispatcher()
     feishu = FeishuIMProvider()
     router = Router(store, dispatcher, feishu)
+    bundler = MessageBundler(router.dispatch)
 
     # 1. 初始化异步队列
     event_queue = asyncio.Queue()
 
     # 2. 启动异步任务
-    worker_task = asyncio.create_task(worker(event_queue, router))
+    worker_task = asyncio.create_task(worker(event_queue, bundler))
     ttl_task = asyncio.create_task(cleanup_task(dispatcher))
 
     # 3. 在独立线程中启动飞书 WebSocket 监听器

@@ -199,7 +199,9 @@ class FeishuIMProvider:
             return False
 
     async def add_reaction(self, message_id: str, emoji_type: str) -> Optional[str]:
-        """为消息添加表情回复"""
+        """为消息添加表情回复 (增强型：支持重试与详细日志)"""
+        logger.debug(f"[FeishuIM] 准备添加表情 {emoji_type} -> 消息 {message_id}")
+        
         request = (
             lark.im.v1.CreateMessageReactionRequest.builder()
             .message_id(message_id)
@@ -210,11 +212,35 @@ class FeishuIMProvider:
             )
             .build()
         )
-        response = await self.client.im.v1.message_reaction.acreate(request)
-        if response.success():
-            return response.data.reaction_id
-        
-        logger.error(f"[add_reaction] 失败: {response.msg} (code: {response.code}, emoji: {emoji_type}, msg_id: {message_id})")
+
+        for attempt in range(2): # 最多尝试 2 次
+            try:
+                # 延长至 5 秒超时，确保冷启动 Token 获取有足够时间
+                response = await asyncio.wait_for(
+                    self.client.im.v1.message_reaction.acreate(request),
+                    timeout=5.0
+                )
+                
+                if response.success():
+                    logger.debug(f"[FeishuIM] 表情 {emoji_type} 添加成功 (尝试次数: {attempt+1})")
+                    return response.data.reaction_id
+                
+                # 记录详细的飞书错误信息
+                log_id = response.get_log_id()
+                logger.error(f"[FeishuIM] 添加表情失败: {response.msg} (code: {response.code}, log_id: {log_id}, emoji: {emoji_type})")
+                
+                # 如果是频率限制等可重试错误，可以在此根据 code 判断是否继续循环
+                if response.code != 99991663: # 99991663 通常是无权限，重试也没用
+                    await asyncio.sleep(1.0)
+                    continue
+                break
+                
+            except asyncio.TimeoutError:
+                logger.warning(f"[FeishuIM] 添加表情请求超时 (10s), 正在尝试重试... ({attempt+1}/2)")
+            except Exception as e:
+                logger.error(f"[FeishuIM] 添加表情发生异常: {e}")
+                break
+                
         return None
 
     async def delete_bot_reaction_by_type(self, message_id: str, emoji_type: str) -> bool:
