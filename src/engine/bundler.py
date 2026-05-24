@@ -80,7 +80,7 @@ class MessageBundler:
         """添加一个事件到打包器"""
         event_type = event.get("header", {}).get("event_type")
         
-        # 仅打包消息接收事件，且仅当功能启用时
+        # 仅打包消息接收事件（im.message.receive_v1），卡片交互和表情授权需立即响应
         if event_type != "im.message.receive_v1" or not config.bundling_enabled:
             await self.dispatch_callback(event)
             return

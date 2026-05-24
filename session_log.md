@@ -98,3 +98,33 @@
 
 ### State
 - **交互趣味性**: 机器人现在会随机选用不同的表情（如 `Eyes`, `SMILE`, `RAINBOW` 等）来反馈受理和完成状态，提升了产品的亲和力。
+
+## [2026-05-24] 修复：卡片模式授权回调异常
+
+### Done
+- **Router 核心修复**:
+    - **修复 (NameError)**: 在 `src/engine/router.py` 中增加了缺失的 `import lark_oapi as lark`，解决了卡片回调处理时 `name 'lark' is not defined` 的崩溃问题。
+    - **修复 (Message ID)**: 修正了 `_handle_card_action` 中获取消息 ID 的逻辑，将 `event_data.get("context", {}).get("message_id")` 更新为飞书标准字段 `open_message_id`。
+    - **全链路打通**: 修复后，卡片模式下的“允许”和“拒绝”操作均能正确获取上下文消息 ID，并成功调用 `reply` 进行状态反馈及 `apatch` 更新卡片展示内容。
+- **卡片模式双重确认机制**:
+    - 在 `src/utils/card_builder.py` 中增加了 `build_double_confirm_card` 方法，并重构了 `build_permission_card`，将第一步按钮改为“申请执行”。
+    - 在 `Router._handle_card_action` 中实现了状态机：
+        - `confirm`: 第一步申请 -> 更新为二次确认卡片，数据库 `confirm_step` 更新为 2。
+        - `back`: 从二次确认卡片返回 -> 恢复为初始申请卡片，数据库 `confirm_step` 回退为 1。
+        - `allow`: 第二步最终确认 -> 执行 ACP 决策并展示结果。
+    - 统一了卡片模式与表情模式的“双重确认”安全标准。
+- **交互逻辑解耦 (Interaction Separation)**:
+    - 实现了卡片模式与非卡片（表情）模式的完全隔离：
+        - **卡片模式**: 移除所有授权相关的文本消息回复，转而通过 `apatch` 实时更新卡片展示状态（包括“已授权”、“已拒绝”及“已失效”）。
+        - **非卡片模式**: 保留原有的文本回复（“✅ 授权已通过...”）和表情反馈（`Error`）机制。
+    - 在 `CardBuilder` 中新增了 `build_expired_card` 样式，用于处理用户直接输入新消息导致旧卡片自动失效的场景。
+- **交互冲突规避与逻辑分割 (Conflict Resolution)**:
+    - 在 `_handle_reaction` 中增加了 `acp_card_mode_enabled` 校验：当卡片模式开启时，系统会显式忽略所有表情授权事件。
+    - **设计意图**: 实现了“卡片模式全通过卡片交互、非卡片模式全通过消息和表情回复交互”的物理隔离，避免了在卡片消息上点赞触发文本二次确认的混淆场景。
+- **并发与幂等性优化 (Idempotency & Feedback)**:
+    - **即时反馈**: 在 `_handle_card_action` 启动时立即异步添加 `REACTION_GET` 表情，处理完成后通过 `finally` 块确保清理，增强了卡片点击后的即时视觉反馈。
+    - **原子化决策**: 重构了 `_execute_confirm_decision`，将 `remove_pending_confirm` 移动至函数开头，利用数据库 `rowcount` 实现了原子的“检查并删除”逻辑，防止高并发下的重复授权执行。
+    - **状态机幂等**: 在卡片多步跳转中增加了 `confirm_step` 校验，确保同一卡片状态无法被重复触发。
+
+### State
+- **授权稳定性**: 修复了卡片模式授权的核心路径缺陷，确保在开启 `acp_card_mode_enabled` 时系统依然健壮。

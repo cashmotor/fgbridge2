@@ -125,7 +125,10 @@ class StateStore:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
 
-    async def remove_pending_confirm(self, confirm_id: str):
+    async def remove_pending_confirm(self, confirm_id: str) -> int:
+        """删除挂起的确认请求，返回受影响的行数"""
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("DELETE FROM pending_confirms WHERE confirm_id = ?", (confirm_id,))
-            await db.commit()
+            async with db.execute("DELETE FROM pending_confirms WHERE confirm_id = ?", (confirm_id,)) as cursor:
+                count = cursor.rowcount
+                await db.commit()
+                return count

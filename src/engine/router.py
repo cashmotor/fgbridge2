@@ -6,6 +6,7 @@ import re
 import asyncio
 from typing import Optional, List, Dict, Any
 from loguru import logger
+import lark_oapi as lark
 from src.storage.state_store import StateStore
 from src.engine.dispatcher import ACPDispatcher
 from src.provider.feishu_im import FeishuIMProvider
@@ -141,6 +142,10 @@ class Router:
 
     async def _handle_reaction(self, event_data: dict):
         """处理表情授权逻辑"""
+        # 1. 交互分割：如果已开启卡片模式，则忽略表情授权，确保用户仅通过卡片交互
+        if config.acp_card_mode_enabled:
+            return
+
         # 修正：直接从 event_data 获取 operator_type (飞书 2.0 格式)
         operator_type = event_data.get("operator_type")
         if operator_type != "user":
@@ -193,6 +198,12 @@ class Router:
     async def _execute_confirm_decision(self, pending: dict, decision: str, current_msg_id: str):
         """执行最终授权决策并反馈 (异步化)"""
         confirm_id = pending["confirm_id"]
+        
+        # 幂等性保护：尝试从数据库移除，如果移除失败说明已被其他任务处理
+        if await self.store.remove_pending_confirm(confirm_id) == 0:
+            logger.warning(f"授权请求 {confirm_id} 已处理或正在处理中，跳过重复执行")
+            return
+
         topic_id = pending["topic_id"]
         session_id = pending["session_id"]
         
@@ -207,10 +218,10 @@ class Router:
         resp = await asyncio.to_thread(acp.confirm, session_id, confirm_id, decision)
         await asyncio.to_thread(acp.session_save, session_id)
         
-        await self.store.remove_pending_confirm(confirm_id)
-        
-        status_text = "✅ 授权已通过，正在继续执行..." if decision == "allow" else "❌ 授权已拒绝。"
-        await self.feishu.reply(current_msg_id, status_text)
+        # 仅在非卡片模式下回复状态消息，卡片模式通过 Patch 卡片展示状态
+        if not config.acp_card_mode_enabled:
+            status_text = "✅ 授权已通过，正在继续执行..." if decision == "allow" else "❌ 授权已拒绝。"
+            await self.feishu.reply(current_msg_id, status_text)
         
         await self._handle_acp_response(resp, "", current_msg_id, session_id, topic_id)
 
@@ -219,11 +230,23 @@ class Router:
         pendings = await self.store.get_pending_confirms_by_topic(topic_id)
         for p in pendings:
             logger.info(f"检测到新消息，自动失效旧授权: {p['confirm_id']}")
-            if p.get("msg_id"):
-                await self.feishu.reply(p["msg_id"], "⌛ 此授权请求已因新消息输入而自动失效。")
-                # 增加失效表情反馈
-                if config.reaction_invalid:
-                    await self.feishu.add_reaction(p["msg_id"], config.reaction_invalid)
+            msg_id = p.get("msg_id")
+            if msg_id:
+                if config.acp_card_mode_enabled:
+                    # 卡片模式：更新原卡片为失效状态
+                    expired_card = CardBuilder.build_expired_card(p["action_type"])
+                    await self.feishu.client.im.v1.message.apatch(
+                        lark.im.v1.PatchMessageRequest.builder()
+                        .message_id(msg_id)
+                        .request_body(lark.im.v1.PatchMessageRequestBody.builder().content(expired_card).build())
+                        .build()
+                    )
+                else:
+                    # 表情模式：回复失效消息并加表情
+                    await self.feishu.reply(msg_id, "⌛ 此授权请求已因新消息输入而自动失效。")
+                    if config.reaction_invalid:
+                        await self.feishu.add_reaction(msg_id, config.reaction_invalid)
+            
             await self.store.remove_pending_confirm(p["confirm_id"])
 
     async def _process_attachments(self, message: dict, text: str) -> tuple[str, list]:
@@ -400,9 +423,11 @@ class Router:
             message = result.get("message")
             
             if config.acp_card_mode_enabled:
-                await self.store.add_pending_confirm(confirm_id, topic_id, session_id, action, message)
                 card_content = CardBuilder.build_permission_card(confirm_id, action, message)
-                return await self.feishu.reply(message_id, card_content, msg_type="interactive")
+                sent_msg_id = await self.feishu.reply(message_id, card_content, msg_type="interactive")
+                if sent_msg_id:
+                    await self.store.add_pending_confirm(confirm_id, topic_id, session_id, action, message, msg_id=sent_msg_id, confirm_step=1)
+                return sent_msg_id
             else:
                 prompt = f"🔐 [安全拦截] 进程申请执行高危操作：\n\n**{action}**\n\n{message}\n\n👉 **授权方式**：\n请在此消息下回复表情：点赞(YES/OK)同意，点踩(NO)拒绝。"
                 sent_msg_id = await self.feishu.reply(message_id, prompt)
@@ -419,15 +444,52 @@ class Router:
         confirm_id = action_value.get("confirm_id")
         decision = action_value.get("decision")
         if not confirm_id: return
-        pending = await self.store.get_pending_confirm(confirm_id)
-        if not pending: return
         
-        await self._execute_confirm_decision(pending, decision, event_data.get("context", {}).get("message_id"))
-        
-        new_card = CardBuilder.build_result_card(pending["action_type"], decision)
-        await self.feishu.client.im.v1.message.apatch(
-            lark.im.v1.PatchMessageRequest.builder()
-            .message_id(event_data.get("context", {}).get("message_id"))
-            .request_body(lark.im.v1.PatchMessageRequestBody.builder().content(new_card).build())
-            .build()
-        )
+        # 飞书卡片回调上下文中的消息 ID 字段为 open_message_id
+        message_id = event_data.get("context", {}).get("open_message_id")
+        if not message_id:
+            logger.error(f"卡片回调事件中缺少 open_message_id: {event_data}")
+            return
+
+        # 1. 立即反馈：添加 GET 表情告知受理 (非阻塞)
+        if config.reaction_get:
+            asyncio.create_task(self.feishu.add_reaction(message_id, config.reaction_get))
+
+        try:
+            pending = await self.store.get_pending_confirm(confirm_id)
+            if not pending: 
+                logger.debug(f"卡片操作 {confirm_id} 已失效或不存在")
+                return
+            
+            # 2. 逻辑分发与幂等保护
+            new_card = None
+            if decision == "confirm":
+                if pending["confirm_step"] != 1: return # 幂等保护
+                new_card = CardBuilder.build_double_confirm_card(confirm_id, pending["action_type"])
+                await self.store.update_pending_confirm_step(confirm_id, step=2, msg_id=message_id)
+            
+            elif decision == "back":
+                if pending["confirm_step"] != 2: return # 幂等保护
+                new_card = CardBuilder.build_permission_card(confirm_id, pending["action_type"], pending["message"])
+                await self.store.update_pending_confirm_step(confirm_id, step=1, msg_id=message_id)
+                
+            elif decision in ["allow", "deny"]:
+                # 最终决策由 _execute_confirm_decision 内部进行 remove 原子化保护
+                await self._execute_confirm_decision(pending, decision, message_id)
+                new_card = CardBuilder.build_result_card(pending["action_type"], decision)
+            else:
+                logger.warning(f"未知卡片决策: {decision}")
+                return
+
+            # 3. 更新原卡片内容 (Patch)
+            if new_card:
+                await self.feishu.client.im.v1.message.apatch(
+                    lark.im.v1.PatchMessageRequest.builder()
+                    .message_id(message_id)
+                    .request_body(lark.im.v1.PatchMessageRequestBody.builder().content(new_card).build())
+                    .build()
+                )
+        finally:
+            # 4. 无论成功失败，清理受理表情
+            if config.reaction_get:
+                await self.feishu.delete_bot_reaction_by_type(message_id, config.reaction_get)

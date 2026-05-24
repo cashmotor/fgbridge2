@@ -123,7 +123,12 @@ def test_message_bundling_attachments():
         
         assert len(received_events) == 1
         msg = received_events[0]["event"]["message"]
-        assert "img_1" in msg["image_keys"]
-        assert "file_1" in msg["file_keys"]
+        
+        # Bundler 现在的逻辑是将附件放入 bundled_images 和 bundled_files
+        bundled_images = [item["key"] for item in msg.get("bundled_images", [])]
+        bundled_files = [item["key"] for item in msg.get("bundled_files", [])]
+        
+        assert "img_1" in bundled_images
+        assert "file_1" in bundled_files
 
     asyncio.run(run())

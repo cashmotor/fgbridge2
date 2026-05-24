@@ -7,7 +7,7 @@ class CardBuilder:
     """
     @staticmethod
     def build_permission_card(confirm_id: str, action: str, message: str) -> str:
-        """构建高危操作确认卡片"""
+        """构建高危操作确认卡片 (第一步)"""
         card = {
             "config": {"wide_screen_mode": True},
             "header": {
@@ -31,15 +31,50 @@ class CardBuilder:
                     "actions": [
                         {
                             "tag": "button",
-                            "text": {"content": "允许执行", "tag": "plain_text"},
+                            "text": {"content": "申请执行", "tag": "plain_text"},
                             "type": "primary",
-                            "value": {"decision": "allow", "confirm_id": confirm_id}
+                            "value": {"decision": "confirm", "confirm_id": confirm_id}
                         },
                         {
                             "tag": "button",
                             "text": {"content": "拒绝并取消", "tag": "plain_text"},
                             "type": "danger",
                             "value": {"decision": "deny", "confirm_id": confirm_id}
+                        }
+                    ]
+                }
+            ]
+        }
+        return json.dumps(card, ensure_ascii=False)
+
+    @staticmethod
+    def build_double_confirm_card(confirm_id: str, action: str) -> str:
+        """构建二次确认卡片 (第二步)"""
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "template": "orange",
+                "title": {"content": "🛡️ 二次安全确认", "tag": "plain_text"}
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {"content": f"**确定要执行以下操作吗？**\n\n> {action}", "tag": "lark_md"}
+                },
+                {
+                    "tag": "action",
+                    "actions": [
+                        {
+                            "tag": "button",
+                            "text": {"content": "确认执行", "tag": "plain_text"},
+                            "type": "primary",
+                            "value": {"decision": "allow", "confirm_id": confirm_id}
+                        },
+                        {
+                            "tag": "button",
+                            "text": {"content": "返回修改/取消", "tag": "plain_text"},
+                            "type": "default",
+                            "value": {"decision": "back", "confirm_id": confirm_id}
                         }
                     ]
                 }
@@ -63,6 +98,24 @@ class CardBuilder:
                 {
                     "tag": "div",
                     "text": {"content": f"**操作**: {action}\n该请求已被处理。", "tag": "lark_md"}
+                }
+            ]
+        }
+        return json.dumps(card, ensure_ascii=False)
+
+    @staticmethod
+    def build_expired_card(action: str) -> str:
+        """构建已失效卡片"""
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "template": "grey",
+                "title": {"content": "⌛ 授权请求已失效", "tag": "plain_text"}
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {"content": f"**操作**: {action}\n此授权请求已因新消息输入而自动失效。", "tag": "lark_md"}
                 }
             ]
         }
