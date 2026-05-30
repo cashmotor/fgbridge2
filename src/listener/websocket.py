@@ -3,6 +3,7 @@ import json
 from loguru import logger
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1, P2ImMessageReactionCreatedV1
+from lark_oapi.api.application.v6 import P2ApplicationBotMenuV6
 from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTrigger
 from src.config import config
 
@@ -21,6 +22,7 @@ class FeishuWebSocketListener:
             .register_p2_im_message_receive_v1(self._on_message_received)
             .register_p2_card_action_trigger(self._on_card_action_triggered)
             .register_p2_im_message_reaction_created_v1(self._on_reaction_received)
+            .register_p2_application_bot_menu_v6(self._on_menu_triggered)
             .build()
         )
 
@@ -93,6 +95,23 @@ class FeishuWebSocketListener:
                 logger.warning("事件循环未在运行，无法投递表情事件")
         except Exception as e:
             logger.error(f"投递表情事件失败: {e}")
+
+    def _on_menu_triggered(self, data: P2ApplicationBotMenuV6) -> None:
+        """接收到机器人菜单点击事件"""
+        logger.info(f"收到机器人菜单事件: {data.event.event_key} (Operator: {data.event.operator.operator_id.open_id})")
+        payload = {
+            "header": {
+                "event_type": "application.bot.menu_v6",
+                "event_id": data.header.event_id
+            },
+            "event": json.loads(lark.JSON.marshal(data.event))
+        }
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.run_coroutine_threadsafe(self.event_queue.put(payload), loop)
+        except Exception as e:
+            logger.error(f"投递菜单事件失败: {e}")
 
     def start(self):
         """启动监听器 (阻塞)"""

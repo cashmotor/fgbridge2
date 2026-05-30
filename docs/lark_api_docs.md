@@ -91,3 +91,8 @@
 - **下载素材**：https://open.feishu.cn/document/server-docs/docs/drive-v1/media/download
 - **获取素材临时下载链接**：https://open.feishu.cn/document/server-docs/docs/drive-v1/media/batch_get_tmp_download_url
 
+# 机器人
+
+## 事件
+
+- **机器人自定义菜单事件**：https://open.feishu.cn/document/client-docs/bot-v3/events/menu

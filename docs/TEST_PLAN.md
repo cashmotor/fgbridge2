@@ -61,6 +61,15 @@
 | DISP-01 | 进程按需唤醒 | `ACPDispatcher` 为空 | 调用 `dispatcher.get_acp("Designer")`。 | 实例化新的 `ACPProvider` 存入 pool，返回可用实例。 |
 | DISP-02 | 进程自动清理 | `EXPERT_TTL=2`秒 | 唤醒一个专家进程，等待 3 秒后执行 `cleanup()`。 | 该进程从 pool 移除，底层 `gemini cli` 进程被 `stop()`。 |
 
+### 2.6. Session 管理与多话题切换 (Session Management)
+
+| 用例 ID | 测试目标 | 前置条件 | 操作步骤 | 预期结果 |
+| :--- | :--- | :--- | :--- | :--- |
+| SES-01 | 菜单事件分发与校验 | `config.feishu_user_ids` 配置了特定 ID | 模拟/发送 `application.bot.menu_v6` 事件，`event_key="FGB_NEW_SESSION"`。 | 1. `Router` 提取 `open_id` 并校验成功。<br> 2. 调用 `acp.session_new`。<br> 3. 回复新会话已开启卡片。 |
+| SES-02 | 历史会话卡片构造 | 数据库中某 Topic 有 3 个 session | 点击“📜 切换历史会话”菜单。 | `CardBuilder` 构造包含 3 个条目的卡片，顺序为最后活跃时间倒序。 |
+| SES-03 | Session 深度重建 | 手动删除 `.session` 缓存文件 | 点击历史卡片中的“切换”按钮。 | 1. `acp.session_load` 返回失败。<br> 2. 触发重建：遍历 `messages` 表并逐条 `send`。<br> 3. 重建后会话恢复正常对话。 |
+| SES-04 | 消息持久化 (Messages) | 无 | 发送一条文本消息并收到 AI 回复。 | 数据库 `messages` 表新增两条记录（role 分别为 user 和 assistant）。 |
+
 ## 3. 端到端 (E2E) 测试演练流程
 
 在模块自测完成后，建议进行一次全流程演练：

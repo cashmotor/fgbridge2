@@ -4,6 +4,8 @@ import mimetypes
 import os
 import re
 import asyncio
+import time
+import traceback
 from typing import Optional, List, Dict, Any
 from loguru import logger
 import lark_oapi as lark
@@ -27,37 +29,64 @@ class Router:
         event_type = header.get("event_type")
         logger.debug(f"Router 接收到事件: {event_type}")
         
-        if event_type == "im.message.receive_v1":
-            await self._handle_message(event.get("event", {}))
-        elif event_type == "card.action.trigger":
-            await self._handle_card_action(event.get("event", {}))
-        elif event_type == "im.message.reaction.receive_v1":
-            await self._handle_reaction(event.get("event", {}))
+        try:
+            if event_type == "im.message.receive_v1":
+                await self._handle_message(event.get("event", {}))
+            elif event_type == "card.action.trigger":
+                await self._handle_card_action(event.get("event", {}))
+            elif event_type == "im.message.reaction.receive_v1":
+                await self._handle_reaction(event.get("event", {}))
+            elif event_type == "application.bot.menu_v6":
+                await self._handle_menu_event(event.get("event", {}))
+        except Exception as e:
+            logger.exception(f"调度事件发生致命错误: {e}")
+            # 尝试给管理员发一张报错卡片
+            await self._report_system_error(f"事件分发失败: {event_type}", e)
+
+    def _check_operator_permission(self, operator_data: dict) -> bool:
+        """校验操作人权限"""
+        open_id = operator_data.get("operator_id", {}).get("open_id")
+        if not open_id:
+            return False
+        if not config.feishu_user_ids:
+            return True # 未配置白名单则默认允许
+        return open_id in config.feishu_user_ids
+
+    async def _report_system_error(self, summary: str, error: Exception, chat_id: str = None):
+        """统一向用户/群组上报异常卡片"""
+        # 1. 构造卡片
+        error_detail = traceback.format_exc()
+        card = CardBuilder.build_error_card(summary, str(error))
+        
+        # 2. 决定发送目标：如果有具体的 chat_id，发给当前上下文；否则发给管理员白名单首位
+        target_id = chat_id
+        if not target_id and config.feishu_user_ids:
+            target_id = config.feishu_user_ids[0]
+            
+        if target_id:
+            logger.info(f"正在向上报目标 {target_id} 发送异常卡片...")
+            await self.feishu.send_text(target_id, card, receive_id_type="open_id" if "ou_" in target_id else "chat_id")
 
     async def _handle_message(self, event_data: dict):
         message = event_data.get("message", {})
         chat_id = message.get("chat_id")
         chat_type = message.get("chat_type")
         message_id = message.get("message_id")
-        # 兼容 message_type 或 msg_type
         msg_type = message.get("message_type") or message.get("msg_type")
         
         logger.debug(f"[_handle_message] 开始处理消息: ID={message_id}, 类型={msg_type}")
         
-        # 0. 立即回复 GET 表情，告知用户已收到消息 (非阻塞)
         if config.reaction_get:
-            logger.debug(f"[_handle_message] 异步提交 GET 表情: {message_id}")
             asyncio.create_task(self.feishu.add_reaction(message_id, config.reaction_get))
 
         thread_id = message.get("thread_id") or ""
         root_id = message.get("root_id") or ""
         
-        logger.debug(f"[_handle_message] 提取内容字段...")
         content_str = message.get("content", "{}")
         try:
             content_json = json.loads(content_str)
         except Exception as e:
-            logger.error(f"[_handle_message] 解析消息内容 JSON 失败: {e}, 内容: {content_str}")
+            logger.error(f"[_handle_message] 解析消息内容 JSON 失败: {e}")
             content_json = {}
 
         text = ""
@@ -65,7 +94,6 @@ class Router:
         if msg_type == "text":
             text = content_json.get("text", "")
         elif msg_type == "post":
-            # 解析富文本消息
             for block_list in content_json.get("content", []):
                 for element in block_list:
                     if element.get("tag") == "text":
@@ -77,419 +105,401 @@ class Router:
                 extracted_image_keys.append(content_json["image_key"])
 
         text = text.strip()
-        
-        # 将解析到的 image_keys 存入 message 供 _process_attachments 使用
         if extracted_image_keys:
             existing_keys = message.get("image_keys") or []
             message["image_keys"] = list(set(existing_keys + extracted_image_keys))
         
-        logger.debug(f"[_handle_message] 准备提取附件: text_len={len(text)}")
-        extra_text, attachments = await self._process_attachments(message, text)
-        
-        if extra_text:
-            logger.debug(f"[_handle_message] 提取到额外文本: {len(extra_text)} chars")
-            text += extra_text
+        try:
+            extra_text, attachments = await self._process_attachments(message, text)
+            if extra_text:
+                text += extra_text
 
-        logger.debug(f"[_handle_message] 最终处理内容: text_len={len(text)}, attachments_count={len(attachments)}")
+            if not text and not attachments:
+                if config.reaction_invalid:
+                    await self.feishu.add_reaction(message_id, config.reaction_invalid)
+                return
 
-        if not text and not attachments:
-            logger.warning(f"[_handle_message] 消息内容和附件均为空，跳过处理 (ID={message_id})")
-            # 标记为跳过/无效
-            if config.reaction_invalid:
-                await self.feishu.add_reaction(message_id, config.reaction_invalid)
-            return
+            topic_id = ""
+            target_role = ""
+            is_subtask = False
+            open_id = event_data.get("sender", {}).get("sender_id", {}).get("open_id")
 
-        topic_id = ""
-        target_role = ""
-        is_subtask = False
-
-        if chat_type == "p2p":
-            if thread_id:
-                topic_id = thread_id
-                is_subtask = True
+            if chat_type == "p2p":
+                topic_id = thread_id if thread_id else chat_id
+                target_role = config.assistant_role
+                is_subtask = bool(thread_id)
+                
+                if open_id and chat_id:
+                    await self.store.save_user_chat(open_id, chat_id)
+                if open_id and not is_subtask:
+                    if await self.store.get_topic(open_id):
+                        await self.store.migrate_topic_and_sessions(open_id, chat_id)
             else:
-                topic_id = chat_id
-                target_role = config.assistant_role
-        else:
-            if thread_id:
-                topic_id = thread_id
-                is_subtask = True
-            elif root_id:
-                topic_id = root_id
-                target_role = config.assistant_role
-            else:
-                topic_id = chat_id
-                target_role = config.assistant_role
+                if thread_id:
+                    topic_id, is_subtask = thread_id, True
+                elif root_id:
+                    topic_id, target_role = root_id, config.assistant_role
+                else:
+                    topic_id, target_role = chat_id, config.assistant_role
 
-        logger.debug(f"[_handle_message] 路由决策: topic_id={topic_id}, role={target_role}, is_subtask={is_subtask}")
-
-        # 1. 核心增强：检测到新消息，自动失效挂起的授权
-        await self._auto_expire_pending_confirms(topic_id)
-
-        topic = await self.store.get_topic(topic_id)
-        logger.debug(f"[_handle_message] 获取 Topic 状态: {'found' if topic else 'not found'}")
-        
-        if is_subtask:
-            if not topic:
-                logger.debug(f"[_handle_message] 分发至 _bind_topic_and_route")
+            await self._auto_expire_pending_confirms(topic_id)
+            topic = await self.store.get_topic(topic_id)
+            
+            if is_subtask and not topic:
                 await self._bind_topic_and_route(chat_id, topic_id, message_id, text, attachments)
             else:
-                logger.debug(f"[_handle_message] 分发至 _route_to_role (subtask)")
-                await self._route_to_role(topic["role"], chat_id, message_id, text, attachments, topic, topic_id, message_id)
-        else:
-            logger.debug(f"[_handle_message] 分发至 _route_to_role (main)")
-            await self._route_to_role(target_role, chat_id, message_id, text, attachments, topic, topic_id, message_id)
+                role = topic["role"] if topic else target_role
+                await self._route_to_role(role, chat_id, message_id, text, attachments, topic, topic_id, message_id)
+        except Exception as e:
+            logger.exception(f"处理消息过程中发生异常: {e}")
+            await self._report_system_error("消息解析与路由失败", e, chat_id)
 
     async def _handle_reaction(self, event_data: dict):
         """处理表情授权逻辑"""
-        # 1. 交互分割：如果已开启卡片模式，则忽略表情授权，确保用户仅通过卡片交互
-        if config.acp_card_mode_enabled:
-            return
-
-        # 修正：直接从 event_data 获取 operator_type (飞书 2.0 格式)
+        if config.acp_card_mode_enabled: return
+        
         operator_type = event_data.get("operator_type")
-        if operator_type != "user":
-            logger.debug(f"忽略非用户表情事件 (Operator: {operator_type})")
-            return
+        if operator_type != "user": return
 
         emoji_type = event_data.get("reaction_type", {}).get("emoji_type", "").upper()
         message_id = event_data.get("message_id")
         
-        # 1. 查找该消息关联的授权请求
-        pending = await self.store.get_pending_confirm_by_msg_id(message_id)
-        if not pending:
-            logger.debug(f"消息 {message_id} 未关联任何挂起的授权请求")
+        try:
+            pending = await self.store.get_pending_confirm_by_msg_id(message_id)
+            if not pending: return
+
+            confirm_id, step = pending["confirm_id"], pending["confirm_step"]
+            is_yes = emoji_type in [e.upper() for e in config.reaction_yes]
+            is_no = emoji_type in [e.upper() for e in config.reaction_no]
+
+            if not is_yes and not is_no: return
+
+            if is_yes:
+                if step == 1:
+                    confirm_msg = "⚠️ [二次确认] 确定要执行上述授权操作吗？\n请再次点赞(YES/OK)确认，或点踩(NO)取消。"
+                    new_id = await self.feishu.reply(message_id, confirm_msg)
+                    if new_id: await self.store.update_pending_confirm_step(confirm_id, step=2, msg_id=new_id)
+                else:
+                    await self._execute_confirm_decision(pending, "allow", message_id)
+            elif is_no:
+                if step == 2:
+                    prompt = f"🛑 操作已取消。如果需要重新授权，请在此前消息下回复表情：\n{pending['message']}\n\n👉 点 YES 同意，点 NO 拒绝。"
+                    new_id = await self.feishu.reply(message_id, prompt)
+                    if new_id: await self.store.update_pending_confirm_step(confirm_id, step=1, msg_id=new_id)
+                else:
+                    await self._execute_confirm_decision(pending, "deny", message_id)
+        except Exception as e:
+            logger.exception(f"处理表情事件失败: {e}")
+            # 表情事件通常是静默报错，不一定需要打扰用户，但在 DEBUG 期间可以上报
+            # await self._report_system_error("表情授权执行失败", e)
+
+    async def _handle_menu_event(self, event_data: dict):
+        """处理机器人自定义菜单事件 (UX 优化版)"""
+        operator = event_data.get("operator", {})
+        event_key = event_data.get("event_key")
+        open_id = operator.get("operator_id", {}).get("open_id")
+        
+        if not self._check_operator_permission(operator):
+            logger.warning(f"非法菜单操作: {open_id}")
+            if open_id:
+                card = CardBuilder.build_simple_text_card("🚫 无权操作", "抱歉，您不在授权名单中，无法使用此菜单。")
+                await self.feishu.send_text(open_id, card, receive_id_type="open_id")
             return
 
-        confirm_id = pending["confirm_id"]
-        step = pending["confirm_step"]
-        
-        logger.info(f"Router 识别到授权表情: {emoji_type} (ConfirmID: {confirm_id}, Step: {step})")
+        chat_id = await self.store.get_chat_id_by_open_id(open_id)
+        topic_id = chat_id if chat_id else open_id
 
-        # 2. 匹配表情类型
-        is_yes = emoji_type in [e.upper() for e in config.reaction_yes]
-        is_no = emoji_type in [e.upper() for e in config.reaction_no]
-
-        if not is_yes and not is_no:
-            logger.debug(f"表情 {emoji_type} 不在 YES/NO 映射表中，忽略")
-            return
-
-        # 3. 执行逻辑分发
-        if is_yes:
-            if step == 1:
-                confirm_msg = "⚠️ [二次确认] 确定要执行上述授权操作吗？\n请再次点赞(YES/OK)确认，或点踩(NO)取消。"
-                new_msg_id = await self.feishu.reply(message_id, confirm_msg)
-                if new_msg_id:
-                    await self.store.update_pending_confirm_step(confirm_id, step=2, msg_id=new_msg_id)
-                    logger.info(f"授权 {confirm_id} 进入二次确认阶段 (NewMsg: {new_msg_id})")
-            else:
-                await self._execute_confirm_decision(pending, "allow", message_id)
-        
-        elif is_no:
-            if step == 2:
-                logger.info(f"授权 {confirm_id} 在二次确认阶段被拒绝，正在回退...")
-                prompt = f"🛑 操作已取消。如果需要重新授权，请在此前消息下回复表情：\n{pending['message']}\n\n👉 点 YES 同意，点 NO 拒绝。"
-                new_msg_id = await self.feishu.reply(message_id, prompt)
-                if new_msg_id:
-                    await self.store.update_pending_confirm_step(confirm_id, step=1, msg_id=new_msg_id)
-            else:
-                await self._execute_confirm_decision(pending, "deny", message_id)
-
-    async def _execute_confirm_decision(self, pending: dict, decision: str, current_msg_id: str):
-        """执行最终授权决策并反馈 (异步化)"""
-        confirm_id = pending["confirm_id"]
-        
-        # 幂等性保护：尝试从数据库移除，如果移除失败说明已被其他任务处理
-        if await self.store.remove_pending_confirm(confirm_id) == 0:
-            logger.warning(f"授权请求 {confirm_id} 已处理或正在处理中，跳过重复执行")
-            return
-
-        topic_id = pending["topic_id"]
-        session_id = pending["session_id"]
-        
-        topic = await self.store.get_topic(topic_id)
-        role = topic["role"] if topic else config.assistant_role
-        
-        # 异步获取 ACP
-        acp = await asyncio.to_thread(self.dispatcher.get_acp, role)
-        logger.info(f"正在执行授权决策: {confirm_id} -> {decision}")
-        
-        # 异步执行确认并保存
-        resp = await asyncio.to_thread(acp.confirm, session_id, confirm_id, decision)
-        await asyncio.to_thread(acp.session_save, session_id)
-        
-        # 仅在非卡片模式下回复状态消息，卡片模式通过 Patch 卡片展示状态
-        if not config.acp_card_mode_enabled:
-            status_text = "✅ 授权已通过，正在继续执行..." if decision == "allow" else "❌ 授权已拒绝。"
-            await self.feishu.reply(current_msg_id, status_text)
-        
-        await self._handle_acp_response(resp, "", current_msg_id, session_id, topic_id)
-
-    async def _auto_expire_pending_confirms(self, topic_id: str):
-        """自动失效指定话题下的所有挂起授权"""
-        pendings = await self.store.get_pending_confirms_by_topic(topic_id)
-        for p in pendings:
-            logger.info(f"检测到新消息，自动失效旧授权: {p['confirm_id']}")
-            msg_id = p.get("msg_id")
-            if msg_id:
-                if config.acp_card_mode_enabled:
-                    # 卡片模式：更新原卡片为失效状态
-                    expired_card = CardBuilder.build_expired_card(p["action_type"])
+        try:
+            if event_key == "FGB_NEW_SESSION":
+                p_card = CardBuilder.build_processing_card("🆕 正在开启新会话", "系统正在初始化全新的 Gemini 上下文...")
+                card_id = await self.feishu.send_text(open_id, p_card, receive_id_type="open_id")
+                
+                acp = await asyncio.to_thread(self.dispatcher.get_acp, config.assistant_role)
+                session_id = await asyncio.to_thread(acp.session_new)
+                await self.store.save_topic(topic_id, chat_id or open_id, role=config.assistant_role, session_id=session_id, turn_count=0)
+                
+                if card_id:
                     await self.feishu.client.im.v1.message.apatch(
                         lark.im.v1.PatchMessageRequest.builder()
-                        .message_id(msg_id)
-                        .request_body(lark.im.v1.PatchMessageRequestBody.builder().content(expired_card).build())
+                        .message_id(card_id)
+                        .request_body(lark.im.v1.PatchMessageRequestBody.builder().content(CardBuilder.build_new_session_card(session_id)).build())
                         .build()
                     )
-                else:
-                    # 表情模式：回复失效消息并加表情
-                    await self.feishu.reply(msg_id, "⌛ 此授权请求已因新消息输入而自动失效。")
-                    if config.reaction_invalid:
-                        await self.feishu.add_reaction(msg_id, config.reaction_invalid)
-            
-            await self.store.remove_pending_confirm(p["confirm_id"])
+                    
+            elif event_key == "FGB_LIST_HISTORY":
+                sessions = await self.store.get_recent_sessions(topic_id)
+                card = CardBuilder.build_session_list_card(sessions)
+                card_id = await self.feishu.send_text(open_id, card, receive_id_type="open_id")
+                if card_id:
+                    await self.store.add_pending_confirm(
+                        f"list_{card_id[:8]}", topic_id, "N/A", "switch_session", "📜 历史会话列表", msg_id=card_id
+                    )
+        except Exception as e:
+            logger.exception(f"处理菜单事件失败: {e}")
+            await self._report_system_error("菜单操作执行失败", e, open_id)
 
-    async def _process_attachments(self, message: dict, text: str) -> tuple[str, list]:
-        extra_text = ""
-        attachments = []
-        message_id = message.get("message_id")
+    async def _handle_card_action(self, event_data: dict):
+        logger.debug(f"[_handle_card_action] 接收到卡片数据: {json.dumps(event_data, ensure_ascii=False)[:500]}")
+        action_value = event_data.get("action", {}).get("value", {})
+        decision = action_value.get("decision")
+        message_id = event_data.get("context", {}).get("open_message_id")
         
-        # 1. 优先获取打包后的带上下文附件
-        bundled_images = message.get("bundled_images") or []
-        bundled_files = message.get("bundled_files") or []
+        # 核心修复：兼容多种飞书标识路径
+        context = event_data.get("context", {})
+        operator = event_data.get("operator", {})
+        open_id = context.get("open_id") or \
+                  operator.get("open_id") or \
+                  operator.get("operator_id", {}).get("open_id")
+                  
+        logger.debug(f"[_handle_card_action] 提取结果: decision={decision}, message_id={message_id}, open_id={open_id}")
         
-        # 2. 如果没有打包数据，则尝试从普通消息结构中提取 (兼容非打包模式)
-        if not bundled_images:
-            image_keys = message.get("image_keys") or []
-            for key in image_keys:
-                bundled_images.append({"key": key, "msg_id": message_id})
-        
-        if not bundled_files:
-            file_keys = message.get("file_keys") or []
-            for key in file_keys:
-                bundled_files.append({"key": key, "msg_id": message_id})
+        if not message_id: return
 
-        logger.debug(f"[_process_attachments] 准备处理附件: images={len(bundled_images)}, files={len(bundled_files)}")
-        
-        # 确保附件目录在 acp 进程工作目录下
-        base_dir = config.gemini_cwd if config.gemini_cwd else os.getcwd()
-        abs_attachment_dir = os.path.join(base_dir, config.attachment_dir)
-        os.makedirs(abs_attachment_dir, exist_ok=True)
+        try:
+            if decision == "switch_session":
+                if not open_id: return
+                logger.debug(f"[_handle_card_action] 开始处理 switch_session: {action_value.get('session_id')}")
+                if config.reaction_get: 
+                    logger.debug(f"[_handle_card_action] 准备异步发送受理表情")
+                    asyncio.create_task(self.feishu.add_reaction(message_id, config.reaction_get))
+                try:
+                    await self._switch_to_session(open_id, action_value.get("session_id"), message_id)
+                    if config.reaction_done: asyncio.create_task(self.feishu.add_reaction(message_id, config.reaction_done))
+                finally:
+                    if config.reaction_get: asyncio.create_task(self.feishu.delete_bot_reaction_by_type(message_id, config.reaction_get))
+                return
 
-        # 3. 处理图片
-        for i, item in enumerate(bundled_images):
-            key = item["key"]
-            origin_msg_id = item["msg_id"]
-            clean_key = key.strip().replace("\"", "").replace("'", "")
-            # 文件名加入 origin_msg_id 以防冲突
-            save_path = os.path.join(abs_attachment_dir, f"{origin_msg_id}_{i}_{clean_key[:8]}.png")
+            confirm_id = action_value.get("confirm_id")
+            if not confirm_id: return
             
-            logger.debug(f"[_process_attachments] 正在下载图片: {clean_key} (来自消息 {origin_msg_id})")
-            if await self.feishu.download_image(clean_key, save_path, message_id=origin_msg_id):
-                with open(save_path, "rb") as f:
-                    data_base64 = base64.b64encode(f.read()).decode("utf-8")
-                attachments.append({"type": "image", "data": data_base64, "mimeType": "image/png"})
-                logger.success(f"[_process_attachments] 图片下载成功: {clean_key}")
-            else:
-                logger.error(f"[_process_attachments] 图片下载失败: {clean_key}")
+            if config.reaction_get: asyncio.create_task(self.feishu.add_reaction(message_id, config.reaction_get))
 
-        # 4. 处理文件
-        for item in bundled_files:
-            key = item["key"]
-            origin_msg_id = item["msg_id"]
-            save_path = os.path.join(abs_attachment_dir, f"{origin_msg_id}_{key[:8]}")
-            
-            logger.debug(f"[_process_attachments] 正在下载文件: {key} (来自消息 {origin_msg_id})")
-            if await self.feishu.download_resource(origin_msg_id, key, save_path, resource_type="file"):
-                attachments.append({"type": "resource_link", "name": key[:8], "uri": f"file://{os.path.abspath(save_path)}"})
-                logger.success(f"[_process_attachments] 文件下载成功: {key}")
-            else:
-                logger.error(f"[_process_attachments] 文件下载失败: {key}")
-
-        # 5. 解析文本中的飞书链接
-        urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', text)
-        for url in urls:
-            if "feishu.cn" not in url:
-                continue
-            
-            doc_info = self.feishu.resolver.parse(url)
-            if doc_info:
-                token = doc_info["token"]
-                obj_type = doc_info["type"]
-                logger.info(f"检测到飞书文档链接: {token} (type: {obj_type})")
+            try:
+                pending = await self.store.get_pending_confirm(confirm_id)
+                if not pending: return
                 
-                export_ext = (config.feishu_export_type or "").strip().lower()
-                content = None
-                
-                # 尝试导出
-                if export_ext:
-                    logger.info(f"正在尝试导出文档为 {export_ext}...")
-                    content = await self.feishu.aexport_document(token, obj_type, export_ext)
-                    if content:
-                        filename = f"exported_{token[:8]}.{export_ext}"
-                        save_path = os.path.join(abs_attachment_dir, f"{message_id}_{filename}")
-                        
-                        with open(save_path, "wb") as f:
-                            f.write(content)
-                        
-                        attachments.append({
-                            "type": "resource_link",
-                            "name": filename,
-                            "uri": f"file://{os.path.abspath(save_path)}"
-                        })
-                        logger.success(f"飞书文档导出成功: {filename}")
-                
-                # 如果未指定导出格式或导出失败，尝试提取 Markdown (仅限 docx)
-                if not content:
-                    actual_token, actual_type = token, obj_type
-                    if obj_type == "wiki":
-                        try:
-                            actual_token, actual_type = await self.feishu.resolver.a_resolve_wiki_node(token)
-                        except:
-                            actual_type = "unknown"
+                new_card = None
+                if decision == "confirm":
+                    if pending["confirm_step"] != 1: return
+                    new_card = CardBuilder.build_double_confirm_card(confirm_id, pending["action_type"])
+                    await self.store.update_pending_confirm_step(confirm_id, step=2, msg_id=message_id)
+                elif decision == "back":
+                    if pending["confirm_step"] != 2: return
+                    new_card = CardBuilder.build_permission_card(confirm_id, pending["action_type"], pending["message"])
+                    await self.store.update_pending_confirm_step(confirm_id, step=1, msg_id=message_id)
+                elif decision in ["allow", "deny"]:
+                    await self._execute_confirm_decision(pending, decision, message_id)
+                    new_card = CardBuilder.build_result_card(pending["action_type"], decision)
 
-                    if actual_type == "docx":
-                        logger.info("提取 Docx Markdown 文本...")
-                        doc_md = await self.feishu.aget_docx_markdown(actual_token)
-                        if doc_md:
-                            extra_text += f"\n\n--- 附件文档内容 [{actual_token}] ---\n{doc_md}\n"
-        
-        return extra_text, attachments
+                if new_card:
+                    await self.feishu.client.im.v1.message.apatch(
+                        lark.im.v1.PatchMessageRequest.builder()
+                        .message_id(message_id)
+                        .request_body(lark.im.v1.PatchMessageRequestBody.builder().content(new_card).build())
+                        .build()
+                    )
+            finally:
+                if config.reaction_get: await self.feishu.delete_bot_reaction_by_type(message_id, config.reaction_get)
+        except Exception as e:
+            logger.exception(f"处理卡片回调失败: {e}")
+            await self._report_system_error("卡片交互执行失败", e, open_id)
 
-    async def _bind_topic_and_route(self, chat_id: str, topic_id: str, message_id: str, text: str, attachments: list):
-        role = "Developer" 
-        # 异步唤醒
-        acp = await asyncio.to_thread(self.dispatcher.get_acp, role)
-        session_id = await asyncio.to_thread(acp.session_new)
+    async def _switch_to_session(self, open_id: str, session_id: str, card_msg_id: str):
+        """执行会话切换并更新卡片"""
+        chat_id = await self.store.get_chat_id_by_open_id(open_id)
+        topic_id = chat_id if chat_id else open_id
         
-        await self.store.save_topic(topic_id, chat_id, role=role, session_id=session_id)
+        logger.debug(f"[_switch_to_session] 标识推导结果: open_id={open_id} -> chat_id={chat_id} -> topic_id={topic_id}")
+        
         topic = await self.store.get_topic(topic_id)
-        await self._route_to_role(role, chat_id, message_id, text, attachments, topic, topic_id, message_id)
+        if not topic:
+            logger.error(f"[_switch_to_session] 无法找到话题 {topic_id}，无法切换")
+            return
+            
+        role = topic["role"]
+        acp = await asyncio.to_thread(self.dispatcher.get_acp, role)
+        
+        logger.info(f"[_switch_to_session] 准备从 {acp._active_session_id} 切换至 {session_id}")
+
+        if not await asyncio.to_thread(acp.session_load, session_id):
+            logger.warning(f"[_switch_to_session] 本地缓存丢失，启动深度重建: {session_id}")
+            await self._reconstruct_session(acp, session_id)
+        else:
+            # 热加载成功后，执行静默冲刷以消耗可能的历史回显包 (TDD v0.2)
+            if config.acp_silent_flush_enabled:
+                logger.info(f"[_switch_to_session] 正在对会话 {session_id} 执行静默冲刷...")
+                await asyncio.to_thread(acp.send, session_id, config.acp_silent_flush_prompt)
+        
+        acp._active_session_id = session_id
+        await self.store.save_topic(topic_id, chat_id or open_id, role=role, session_id=session_id)
+        
+        sessions = await self.store.get_recent_sessions(topic_id, limit=50)
+        target_title = "未知会话"
+        for s in sessions:
+            if s["session_id"] == session_id:
+                target_title = s.get("title") or "未命名会话"
+                break
+
+        pendings = await self.store.get_pending_confirms_by_topic(topic_id)
+        for p in pendings:
+            if p["action_type"] == "switch_session":
+                await self.store.remove_pending_confirm(p["confirm_id"])
+
+        await self.feishu.client.im.v1.message.apatch(
+            lark.im.v1.PatchMessageRequest.builder()
+            .message_id(card_msg_id)
+            .request_body(lark.im.v1.PatchMessageRequestBody.builder().content(CardBuilder.build_switch_success_card(target_title, session_id)).build())
+            .build()
+        )
+        logger.success(f"[_switch_to_session] 会话切换完成: {session_id}")
+
+    async def _reconstruct_session(self, acp, session_id: str):
+        """深度重建 Session 状态并确保内存对齐"""
+        messages = await self.store.get_messages(session_id)
+        await asyncio.to_thread(acp.session_new)
+        for msg in messages:
+            await asyncio.to_thread(acp.send, acp._active_session_id, msg["content"])
+        await asyncio.to_thread(acp.session_save, session_id)
+        acp._active_session_id = session_id
+        logger.success(f"Session 重建完成并已对齐: {session_id}")
 
     async def _route_to_role(self, role: str, chat_id: str, message_id: str, text: str, attachments: list, topic: dict, topic_id: str, origin_msg_id: str):
-        # 异步获取或唤醒 ACP
         acp = await asyncio.to_thread(self.dispatcher.get_acp, role)
-        
         session_id = None
         turn_count = (topic.get("turn_count") or 0) if topic else 0
         is_cold_start = False
 
         if topic and topic.get("session_id"):
             session_id = topic["session_id"]
+            logger.debug(f"[_route_to_role] 数据库 SessionID: {session_id}, ACP 内存 SessionID: {acp._active_session_id}")
             if acp._active_session_id != session_id:
-                # 异步加载 Session
+                logger.info(f"[_route_to_role] 检测到 SessionID 不对齐，尝试执行 session/load: {session_id}")
                 if not await asyncio.to_thread(acp.session_load, session_id):
-                    session_id = await asyncio.to_thread(acp.session_new)
-                    turn_count = 0
-                else:
-                    is_cold_start = True
+                    logger.warning(f"[_route_to_role] 会话 {session_id} 磁盘缓存丢失，尝试重建...")
+                    await self._reconstruct_session(acp, session_id)
+                is_cold_start = True
         else:
             session_id = await asyncio.to_thread(acp.session_new)
             turn_count = 0
+            logger.info(f"[_route_to_role] 开启全新会话: {session_id}")
         
-        turn_count += 1
-        await self.store.save_topic(topic_id, chat_id, role=role, session_id=session_id, turn_count=turn_count)
-        
-        needs_role_init = is_cold_start or (turn_count == 1)
-        if needs_role_init and config.acp_silent_flush_enabled:
-            role_prompt = self.dispatcher.get_role_prompt(role)
-            try:
-                # 异步注入角色
-                await asyncio.to_thread(acp.send, session_id, role_prompt)
-            except Exception as e:
-                logger.error(f"角色注入执行异常: {e}")
+        if not session_id:
+             session_id = acp._active_session_id
+             logger.warning(f"[_route_to_role] session_id 变量丢失，回退至 ACP 内存标识: {session_id}")
 
-        # 异步发送 Prompt 核心调用
-        logger.debug(f"[_route_to_role] 正在发送 Prompt 至 ACP...")
+        turn_count += 1
+        if turn_count == 1:
+            title = text[:15] + ("..." if len(text) > 15 else "")
+            await self.store.update_session_title(session_id, title)
+
+        await self.store.save_topic(topic_id, chat_id, role=role, session_id=session_id, turn_count=turn_count)
+        if (is_cold_start or turn_count == 1) and config.acp_silent_flush_enabled:
+            await asyncio.to_thread(acp.send, session_id, self.dispatcher.get_role_prompt(role))
+
+        await self.store.add_message(session_id, "user", text)
         resp = await asyncio.to_thread(acp.send, session_id, text, attachments)
-        
-        # 异步保存状态
         await asyncio.to_thread(acp.session_save, session_id)
-        
         await self._handle_acp_response(resp, chat_id, origin_msg_id, session_id, topic_id)
         await self._finalize_reaction(origin_msg_id)
-
-    async def _finalize_reaction(self, message_id: str):
-        if config.reaction_done:
-            await self.feishu.add_reaction(message_id, config.reaction_done)
-        if config.reaction_get:
-            await self.feishu.delete_bot_reaction_by_type(message_id, config.reaction_get)
 
     async def _handle_acp_response(self, resp: dict, chat_id: str, message_id: str, session_id: str, topic_id: str) -> Optional[str]:
         result = resp.get("result", {})
         if result.get("type") == "confirmation_required":
-            confirm_id = result.get("confirmationId")
-            action = result.get("action")
-            message = result.get("message")
-            
+            confirm_id, action, message = result.get("confirmationId"), result.get("action"), result.get("message")
             if config.acp_card_mode_enabled:
-                card_content = CardBuilder.build_permission_card(confirm_id, action, message)
-                sent_msg_id = await self.feishu.reply(message_id, card_content, msg_type="interactive")
-                if sent_msg_id:
-                    await self.store.add_pending_confirm(confirm_id, topic_id, session_id, action, message, msg_id=sent_msg_id, confirm_step=1)
-                return sent_msg_id
+                card = CardBuilder.build_permission_card(confirm_id, action, message)
+                sent_id = await self.feishu.reply(message_id, card, msg_type="interactive")
             else:
                 prompt = f"🔐 [安全拦截] 进程申请执行高危操作：\n\n**{action}**\n\n{message}\n\n👉 **授权方式**：\n请在此消息下回复表情：点赞(YES/OK)同意，点踩(NO)拒绝。"
-                sent_msg_id = await self.feishu.reply(message_id, prompt)
-                if sent_msg_id:
-                    await self.store.add_pending_confirm(confirm_id, topic_id, session_id, action, message, msg_id=sent_msg_id, confirm_step=1)
-                    logger.info(f"已发送授权请求消息: {sent_msg_id}")
-                return sent_msg_id
+                sent_id = await self.feishu.reply(message_id, prompt)
+            if sent_id: await self.store.add_pending_confirm(confirm_id, topic_id, session_id, action, message, msg_id=sent_id, confirm_step=1)
+            return sent_id
         else:
             content = result.get("content", str(result))
+            await self.store.add_message(session_id, "assistant", content)
             return await self.feishu.reply(message_id, content)
 
-    async def _handle_card_action(self, event_data: dict):
-        action_value = event_data.get("action", {}).get("value", {})
-        confirm_id = action_value.get("confirm_id")
-        decision = action_value.get("decision")
-        if not confirm_id: return
-        
-        # 飞书卡片回调上下文中的消息 ID 字段为 open_message_id
-        message_id = event_data.get("context", {}).get("open_message_id")
-        if not message_id:
-            logger.error(f"卡片回调事件中缺少 open_message_id: {event_data}")
-            return
+    async def _auto_expire_pending_confirms(self, topic_id: str):
+        pendings = await self.store.get_pending_confirms_by_topic(topic_id)
+        for p in pendings:
+            msg_id = p.get("msg_id")
+            if msg_id:
+                if config.acp_card_mode_enabled or p["action_type"] == "switch_session":
+                    await self.feishu.client.im.v1.message.apatch(lark.im.v1.PatchMessageRequest.builder().message_id(msg_id).request_body(lark.im.v1.PatchMessageRequestBody.builder().content(CardBuilder.build_expired_card(p["action_type"])).build()).build())
+                    if config.reaction_invalid: await self.feishu.add_reaction(msg_id, config.reaction_invalid)
+                else:
+                    await self.feishu.reply(msg_id, "⌛ 此授权请求已因新消息输入而自动失效。")
+                    if config.reaction_invalid: await self.feishu.add_reaction(msg_id, config.reaction_invalid)
+            await self.store.remove_pending_confirm(p["confirm_id"])
 
-        # 1. 立即反馈：添加 GET 表情告知受理 (非阻塞)
-        if config.reaction_get:
-            asyncio.create_task(self.feishu.add_reaction(message_id, config.reaction_get))
+    async def _execute_confirm_decision(self, pending: dict, decision: str, current_msg_id: str):
+        confirm_id = pending["confirm_id"]
+        if await self.store.remove_pending_confirm(confirm_id) == 0: return
+        topic_id, session_id = pending["topic_id"], pending["session_id"]
+        topic = await self.store.get_topic(topic_id)
+        role = topic["role"] if topic else config.assistant_role
+        acp = await asyncio.to_thread(self.dispatcher.get_acp, role)
+        resp = await asyncio.to_thread(acp.confirm, session_id, confirm_id, decision)
+        await asyncio.to_thread(acp.session_save, session_id)
+        if not config.acp_card_mode_enabled:
+            status_text = "✅ 授权已通过，正在继续执行..." if decision == "allow" else "❌ 授权已拒绝。"
+            await self.feishu.reply(current_msg_id, status_text)
+        await self._handle_acp_response(resp, "", current_msg_id, session_id, topic_id)
 
-        try:
-            pending = await self.store.get_pending_confirm(confirm_id)
-            if not pending: 
-                logger.debug(f"卡片操作 {confirm_id} 已失效或不存在")
-                return
-            
-            # 2. 逻辑分发与幂等保护
-            new_card = None
-            if decision == "confirm":
-                if pending["confirm_step"] != 1: return # 幂等保护
-                new_card = CardBuilder.build_double_confirm_card(confirm_id, pending["action_type"])
-                await self.store.update_pending_confirm_step(confirm_id, step=2, msg_id=message_id)
-            
-            elif decision == "back":
-                if pending["confirm_step"] != 2: return # 幂等保护
-                new_card = CardBuilder.build_permission_card(confirm_id, pending["action_type"], pending["message"])
-                await self.store.update_pending_confirm_step(confirm_id, step=1, msg_id=message_id)
-                
-            elif decision in ["allow", "deny"]:
-                # 最终决策由 _execute_confirm_decision 内部进行 remove 原子化保护
-                await self._execute_confirm_decision(pending, decision, message_id)
-                new_card = CardBuilder.build_result_card(pending["action_type"], decision)
-            else:
-                logger.warning(f"未知卡片决策: {decision}")
-                return
+    async def _process_attachments(self, message: dict, text: str) -> tuple[str, list]:
+        extra_text, attachments = "", []
+        message_id = message.get("message_id")
+        bundled_images = message.get("bundled_images") or []
+        bundled_files = message.get("bundled_files") or []
+        if not bundled_images:
+            for key in (message.get("image_keys") or []): bundled_images.append({"key": key, "msg_id": message_id})
+        if not bundled_files:
+            for key in (message.get("file_keys") or []): bundled_files.append({"key": key, "msg_id": message_id})
+        base_dir = config.gemini_cwd or os.getcwd()
+        abs_attachment_dir = os.path.join(base_dir, config.attachment_dir)
+        os.makedirs(abs_attachment_dir, exist_ok=True)
+        for i, item in enumerate(bundled_images):
+            key, origin_id = item["key"], item["msg_id"]
+            save_path = os.path.join(abs_attachment_dir, f"{origin_id}_{i}_{key[:8]}.png")
+            if await self.feishu.download_image(key, save_path, message_id=origin_id):
+                with open(save_path, "rb") as f: data_base64 = base64.b64encode(f.read()).decode("utf-8")
+                attachments.append({"type": "image", "data": data_base64, "mimeType": "image/png"})
+        for item in bundled_files:
+            key, origin_id = item["key"], item["msg_id"]
+            save_path = os.path.join(abs_attachment_dir, f"{origin_id}_{key[:8]}")
+            if await self.feishu.download_resource(origin_id, key, save_path, resource_type="file"):
+                attachments.append({"type": "resource_link", "name": key[:8], "uri": f"file://{os.path.abspath(save_path)}"})
+        urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', text)
+        for url in urls:
+            if "feishu.cn" not in url: continue
+            doc_info = self.feishu.resolver.parse(url)
+            if doc_info:
+                token, obj_type = doc_info["token"], doc_info["type"]
+                export_ext = (config.feishu_export_type or "").strip().lower()
+                content = await self.feishu.aexport_document(token, obj_type, export_ext) if export_ext else None
+                if content:
+                    filename = f"exported_{token[:8]}.{export_ext}"
+                    save_path = os.path.join(abs_attachment_dir, f"{message_id}_{filename}")
+                    with open(save_path, "wb") as f: f.write(content)
+                    attachments.append({"type": "resource_link", "name": filename, "uri": f"file://{os.path.abspath(save_path)}" })
+                else:
+                    actual_token, actual_type = token, obj_type
+                    if obj_type == "wiki": 
+                        try: actual_token, actual_type = await self.feishu.resolver.a_resolve_wiki_node(token)
+                        except: pass
+                    if actual_type == "docx":
+                        doc_md = await self.feishu.aget_docx_markdown(actual_token)
+                        if doc_md: extra_text += f"\n\n--- 附件文档内容 [{actual_token}] ---\n{doc_md}\n"
+        return extra_text, attachments
 
-            # 3. 更新原卡片内容 (Patch)
-            if new_card:
-                await self.feishu.client.im.v1.message.apatch(
-                    lark.im.v1.PatchMessageRequest.builder()
-                    .message_id(message_id)
-                    .request_body(lark.im.v1.PatchMessageRequestBody.builder().content(new_card).build())
-                    .build()
-                )
-        finally:
-            # 4. 无论成功失败，清理受理表情
-            if config.reaction_get:
-                await self.feishu.delete_bot_reaction_by_type(message_id, config.reaction_get)
+    async def _bind_topic_and_route(self, chat_id: str, topic_id: str, message_id: str, text: str, attachments: list):
+        role = "Developer"
+        acp = await asyncio.to_thread(self.dispatcher.get_acp, role)
+        session_id = await asyncio.to_thread(acp.session_new)
+        await self.store.save_topic(topic_id, chat_id, role=role, session_id=session_id)
+        topic = await self.store.get_topic(topic_id)
+        await self._route_to_role(role, chat_id, message_id, text, attachments, topic, topic_id, message_id)
+
+    async def _finalize_reaction(self, message_id: str):
+        if config.reaction_done: await self.feishu.add_reaction(message_id, config.reaction_done)
+        if config.reaction_get: await self.feishu.delete_bot_reaction_by_type(message_id, config.reaction_get)

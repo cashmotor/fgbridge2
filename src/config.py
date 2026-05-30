@@ -10,7 +10,8 @@ class Settings(BaseSettings):
     feishu_app_id: str
     feishu_app_secret: str
     feishu_bot_name: str = "Assistant"
-    feishu_user_id: str = ""  # 管理员 OpenID
+    feishu_user_id: str = ""    # 管理员 OpenID (兼容旧版)
+    feishu_user_ids: Any = []  # 允许操作菜单的 OpenID 列表 (白名单)
     
     # Gemini CLI 配置
     gemini_bin_path: str = "gemini"
@@ -42,7 +43,7 @@ class Settings(BaseSettings):
     reaction_invalid: Any = ["CrossMark"]
     feishu_export_type: str = "pdf" # 飞书文档导出格式，留空则尝试提取文本
 
-    @field_validator("reaction_get", "reaction_done", "reaction_invalid", mode="before")
+    @field_validator("reaction_get", "reaction_done", "reaction_invalid", "feishu_user_ids", mode="before")
     @classmethod
     def validate_reaction_list(cls, v: Any) -> list:
         if isinstance(v, str):
@@ -74,6 +75,15 @@ class Settings(BaseSettings):
         Path(self.session_dir).mkdir(parents=True, exist_ok=True)
         Path(self.attachment_dir).mkdir(parents=True, exist_ok=True)
         Path(self.log_dir).mkdir(parents=True, exist_ok=True)
+
+    def model_post_init(self, __context):
+        """初始化后的兼容性处理"""
+        # 如果新版列表为空，但旧版单字段有值，则迁移到列表
+        if not self.feishu_user_ids and self.feishu_user_id:
+            self.feishu_user_ids = [self.feishu_user_id]
+        # 反之，如果列表有值但单字段没值，同步第一个到单字段（保持 main.py 兼容）
+        elif self.feishu_user_ids and not self.feishu_user_id:
+            self.feishu_user_id = self.feishu_user_ids[0]
 
 config = Settings()
 config.ensure_dirs()

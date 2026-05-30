@@ -14,13 +14,33 @@
 - [x] 捕获 im.message.reaction.created_v1 事件以支持表情授权 @high (2026-05-19)
 - [x] 支持多条连续输入的用户消息打包处理 @high (2026-05-24)
 
+## [Session 管理与多话题切换]
+- [x] **数据库架构演进**:
+    - [x] `sessions` 表: 记录 `session_id`, `topic_id`, `title`, `last_active_time`, `is_active` 等 @high (2026-05-27)
+    - [x] `messages` 表: 实现历史消息持久化（用于本地缓存清理后的 Session 重建） @high (2026-05-27)
+    - [x] `user_chats` 表: 解决 open_id 与 chat_id 映射问题 @high (2026-05-27)
+- [x] **飞书菜单集成**:
+    - [x] 注册 `application.bot.menu_v6` 事件监听并分发至 Router @high (2026-05-27)
+    - [ ] 实现操作人身份校验逻辑（基于 `feishu_user_ids` 白名单）；（未实测） @high (2026-05-27)
+    - [x] 实现 `_handle_menu_event` 逻辑，处理“开启新会话”和“历史会话列表”触发器 @high (2026-05-27)
+- [x] **Session 核心能力实现**:
+    - [x] **New Session**: 生成新 session，清理当前 topic 下的 active 标志，持久化新 session @high (2026-05-27)
+    - [x] **List History**: 构建互动卡片，列出最近 n (默认 5) 个 session，提供“切换”按钮 @high (2026-05-27)
+    - [x] **Switch Action**: 实现卡片点击热切换，并引入 Silent Flush 消除历史回显 @high (2026-05-30)
+- [x] **深度重建逻辑 (Deep Reconstruction)**:
+    - [ ] 实现从 `messages` 表读取历史消息并顺序 replay 的原子操作；（未实测） @high (2026-05-30)
+- [x] **配置与打磨**:
+    - [x] 增加 `history_session_limit` 配置项，默认 5 @low (2026-05-27)
+    - [x] 实现基于首条消息的 Session 自动重命名逻辑 @med (2026-05-27)
+    - [x] 引入全局异常报警卡片，提升系统透明度 @med (2026-05-30)
+- [ ] 机器人菜单操作幂等性保护 @med
+
 ## [状态持久化]
 - [x] 建立 SQLite 数据库模型 (src/storage/state_store.py) @high (2026-05-16)
 - [x] 实现 Topics (Scope-Topic 映射) 存储逻辑 @high (2026-05-16)
 - [x] 实现 Sessions 状态管理逻辑 @med (2026-05-16)
 - [x] 数据库表结构升级，支持多步授权状态追踪 (confirm_step, msg_id) @high (2026-05-19)
-- [ ] 通过飞书机器人菜单切换常驻助理 Session 的能力 @high
-- [ ] 通过飞书机器人菜单重启后段 Python 服务的能力 @med
+- [ ] 通过飞书机器人菜单重启后端 Python 服务的能力 @low
 
 ## [外部集成]
 - [x] 移植并适配 ACP 协议组件 (src/provider/acp.py) @high (2026-05-16)
